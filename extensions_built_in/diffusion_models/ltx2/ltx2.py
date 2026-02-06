@@ -946,61 +946,22 @@ class LTX2Model(BaseModel):
         return unpacked_output
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
+        # Use pipeline's encode_prompt which handles packing correctly for connectors
+        # Manual _pack_text_embeds breaks audio connector input format
         if self.pipeline.text_encoder.device != self.device_torch:
             self.pipeline.text_encoder.to(self.device_torch)
 
-        device = self.device_torch
-        scale_factor = 8
-        batch_size = len(prompt)
-        # Gemma expects left padding for chat-style prompts
-        self.tokenizer[0].padding_side = "left"
-        if self.tokenizer[0].pad_token is None:
-            self.tokenizer[0].pad_token = self.tokenizer[0].eos_token
-
         prompt = [p.strip() for p in prompt]
-        text_inputs = self.tokenizer[0](
-            prompt,
-            # padding="max_length",
-            padding="longest",
-            max_length=1024,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-        prompt_attention_mask = text_inputs.attention_mask
-        
-        text_input_ids = text_input_ids.to(device)
-        prompt_attention_mask = prompt_attention_mask.to(device)
 
-        text_encoder_outputs = self.text_encoder[0](
-            input_ids=text_input_ids,
-            attention_mask=prompt_attention_mask,
-            output_hidden_states=True,
-        )
-        text_encoder_hidden_states = text_encoder_outputs.hidden_states
-        text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
-        sequence_lengths = prompt_attention_mask.sum(dim=-1)
-
-        prompt_embeds = self.pipeline._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=device,
-            padding_side=self.tokenizer[0].padding_side,
-            scale_factor=scale_factor,
+        prompt_embeds, prompt_attention_mask, _ = self.pipeline.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device=self.device_torch,
+            num_videos_per_prompt=1,
+            do_classifier_free_guidance=False,
         )
         prompt_embeds = prompt_embeds.to(dtype=self.torch_dtype)
 
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
-        _, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = prompt_embeds.repeat(1, 1, 1)
-        prompt_embeds = prompt_embeds.view(
-            batch_size * 1, seq_len, -1
-        )
-
-        prompt_attention_mask = prompt_attention_mask.view(batch_size, -1)
-        prompt_attention_mask = prompt_attention_mask.repeat(1, 1)
-        
         pe = PromptEmbeds([prompt_embeds, None])
         pe.attention_mask = prompt_attention_mask
         return pe
