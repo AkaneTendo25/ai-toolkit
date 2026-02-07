@@ -712,6 +712,7 @@ class BaseModel:
             pixel_width=None,
             batch_size=1,
             noise_offset=0.0,
+            num_frames=1,
     ):
         VAE_SCALE_FACTOR = 2 ** (
             len(self.vae.config['block_out_channels']) - 1)

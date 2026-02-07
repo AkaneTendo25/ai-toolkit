@@ -379,8 +379,9 @@ class TrainSliderProcess(BaseSDTrainProcess):
                         timestep_type = self.train_config.timestep_type
                     
                     # make fake latents
-                    l = torch.randn(
-                        true_batch_size, 16, height, width
+                    l = self.sd.get_latent_noise(
+                        pixel_height=height, pixel_width=width,
+                        batch_size=true_batch_size, num_frames=self.slider_config.num_frames,
                     ).to(self.device_torch, dtype=dtype)
                     
                     self.sd.noise_scheduler.set_train_timesteps(
@@ -405,6 +406,7 @@ class TrainSliderProcess(BaseSDTrainProcess):
                     pixel_width=width,
                     batch_size=true_batch_size,
                     noise_offset=self.train_config.noise_offset,
+                    num_frames=self.slider_config.num_frames,
                 ).to(self.device_torch, dtype=dtype)
 
                 # get latents
@@ -603,7 +605,7 @@ class TrainSliderProcess(BaseSDTrainProcess):
 
                 offset_multiplier = torch.tensor(offset_multiplier_list).to(offset.device, dtype=offset.dtype)
                 # make offset multiplier match rank of offset
-                offset_multiplier = offset_multiplier.view(offset.shape[0], 1, 1, 1)
+                offset_multiplier = offset_multiplier.view(offset.shape[0], *([1] * (offset.dim() - 1)))
                 offset *= offset_multiplier
 
                 offset_neutral = neutral_latents_chunk
@@ -626,7 +628,7 @@ class TrainSliderProcess(BaseSDTrainProcess):
                     mask_target_loss = mask_target_loss * (1.0 - mask_multiplier_chunk)
                     loss += mask_target_loss
 
-                loss = loss.mean([1, 2, 3])
+                loss = loss.mean(list(range(1, loss.dim())))
 
                 if self.train_config.learnable_snr_gos:
                     if from_batch:
