@@ -784,7 +784,7 @@ class LTX2Model(BaseModel):
             video_timestep = timestep.clone()
 
             # i2v from first frame
-            if batch.dataset_config.do_i2v and batch.dataset_config.num_frames > 1:
+            if batch is not None and batch.dataset_config.do_i2v and batch.dataset_config.num_frames > 1:
                 # check to see if we had it cached
                 if batch.first_frame_latents is not None:
                     init_latents = batch.first_frame_latents.to(
@@ -840,7 +840,7 @@ class LTX2Model(BaseModel):
                 patch_size_t=self.pipeline.transformer_temporal_patch_size,
             )
 
-            if batch.audio_latents is not None or batch.audio_tensor is not None:
+            if batch is not None and (batch.audio_latents is not None or batch.audio_tensor is not None):
                 if batch.audio_latents is not None:
                     # we have audio latents cached
                     raw_audio_latents = batch.audio_latents.to(
@@ -871,7 +871,7 @@ class LTX2Model(BaseModel):
                     batch_size,
                     num_channels_latents=num_channels_latents_audio,
                     num_mel_bins=num_mel_bins,
-                    num_frames=batch.dataset_config.num_frames,
+                    num_frames=(batch.dataset_config.num_frames if batch is not None else latent_num_frames * 8),
                     frame_rate=frame_rate,
                     sampling_rate=self.pipeline.audio_sampling_rate,
                     hop_length=self.pipeline.audio_hop_length,
@@ -931,7 +931,7 @@ class LTX2Model(BaseModel):
         )
 
         # add audio latent to batch if we had audio
-        if batch.audio_target is not None:
+        if batch is not None and batch.audio_target is not None:
             batch.audio_pred = noise_pred_audio
 
         unpacked_output = self.pipeline._unpack_latents(
@@ -944,6 +944,21 @@ class LTX2Model(BaseModel):
         )
 
         return unpacked_output
+
+    def get_latent_noise(self, height=None, width=None, pixel_height=None, pixel_width=None,
+                         batch_size=1, noise_offset=0.0, num_frames=1):
+        spatial_scale = 32  # LTX-2 VAE spatial compression
+        if height is None:
+            height = pixel_height // spatial_scale
+        if width is None:
+            width = pixel_width // spatial_scale
+        noise = torch.randn(
+            (batch_size, 128, num_frames, height, width),
+            device=self.unet.device,
+        )
+        from toolkit.train_tools import apply_noise_offset
+        noise = apply_noise_offset(noise, noise_offset)
+        return noise
 
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:
         # Use pipeline's encode_prompt which handles packing correctly for connectors

@@ -811,6 +811,7 @@ class SliderConfig:
         self.use_adapter: bool = kwargs.get('use_adapter', None)  # depth
         self.adapter_img_dir = kwargs.get('adapter_img_dir', None)
         self.low_ram = kwargs.get('low_ram', False)
+        self.num_frames = kwargs.get('num_frames', 1)
 
         # expand targets if shuffling
         from toolkit.prompt_utils import get_slider_target_permutations
