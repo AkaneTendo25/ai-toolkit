@@ -67,6 +67,7 @@ transforms_dict = {
 }
 
 img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+audio_ext_list = ['.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.wma']
 
 
 def standardize_images(images):
@@ -744,6 +745,29 @@ class ImageProcessingDTOMixin:
             return
         if self.dataset_config.num_frames > 1:
             self.load_and_process_video(transform, only_load_latents)
+            return
+        if self.dataset_config.do_audio and self.path.lower().endswith(tuple(audio_ext_list)):
+            self.tensor = None
+            self.audio_data = None
+            self.audio_tensor = None
+            try:
+                import torchaudio
+
+                waveform, sample_rate = torchaudio.load(self.path)
+                if self.dataset_config.audio_normalize:
+                    peak = waveform.abs().amax()
+                    eps = 1e-9
+                    target_peak = 0.999
+                    gain = target_peak / (peak + eps)
+                    waveform = waveform * gain
+
+                self.audio_tensor = waveform
+                self.audio_data = {
+                    "waveform": waveform,
+                    "sample_rate": int(sample_rate),
+                }
+            except Exception as e:
+                raise Exception(f"Could not load audio file {self.path}: {e}") from e
             return
         try:
             img = Image.open(self.path)
@@ -1852,13 +1876,21 @@ class LatentCachingMixin:
                     first_frame_latent = None
                     audio_latent = None
                     # add batch dimension
+                    imgs = None
                     try:
-                        imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                        latent = self.sd.encode_images(imgs).squeeze(0)
+                        if file_item.tensor is not None:
+                            imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
+                            latent = self.sd.encode_images(imgs).squeeze(0)
+                        elif file_item.audio_data is not None:
+                            latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
+                        else:
+                            raise ValueError(
+                                f"No image tensor or audio data found for {file_item.path}"
+                            )
                         if to_disk:
                             state_dict['latent'] = latent.clone().detach().cpu()
                     except Exception as e:
-                        print_acc(f"Error processing image: {file_item.path}")
+                        print_acc(f"Error processing image/audio: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
                         raise e
                     # do first frame
@@ -1895,7 +1927,8 @@ class LatentCachingMixin:
                         if audio_latent is not None:
                             file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
 
-                    del imgs
+                    if imgs is not None:
+                        del imgs
                     del latent
                     del file_item.tensor
                     file_item.cleanup()

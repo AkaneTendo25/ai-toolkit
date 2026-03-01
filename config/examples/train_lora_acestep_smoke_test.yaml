@@ -1,0 +1,19 @@
+---
+job: extension
+config:
+  name: "acestep_smoke_test"
+  process:
+    - type: "acestep_lora_trainer"
+      acestep_repo_path: "G:/samples/ACE-Step-1.5"
+      use_uv: true
+      dry_run: true
+
+      # Use fixed/vanilla/estimate to test command generation.
+      subcommand: "fixed"
+      checkpoint_dir: "G:/samples/ACE-Step-1.5/checkpoints"
+      model_variant: "turbo"
+      dataset_dir: "G:/datasets/acestep/preprocessed_tensors/my_dataset"
+      output_dir: "output/[name]"
+
+      # Keep this true so it is ready to execute once dry_run=false.
+      yes: true

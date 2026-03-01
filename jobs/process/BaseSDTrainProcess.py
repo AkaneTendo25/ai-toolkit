@@ -1069,9 +1069,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if batch.latents is not None:
                     latents = batch.latents.to(self.device_torch, dtype=dtype)
                     batch.latents = latents
+                elif batch.audio_latents is not None or (
+                    batch.audio_data is not None and hasattr(self.sd, "encode_audio")
+                ):
+                    if batch.audio_latents is not None:
+                        latents = batch.audio_latents.to(self.device_torch, dtype=dtype)
+                    else:
+                        latents = self.sd.encode_audio(batch.audio_data).to(
+                            self.device_torch, dtype=dtype
+                        )
+                    batch.latents = latents
                 else:
                     # normalize to
-                    if self.train_config.standardize_images:
+                    if self.train_config.standardize_images and imgs is not None:
                         if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
                             target_mean_list = [0.0002, -0.1034, -0.1879]
                             target_std_list = [0.5436, 0.5116, 0.5033]

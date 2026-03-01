@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from toolkit.config_modules import DatasetConfig
 
 printed_messages = []
+audio_extensions = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma")
 
 
 def print_once(msg):
@@ -102,20 +103,31 @@ class FileItemDTO(
             video.release()
             size_database[file_key] = (width, height, file_signature)
         else:
-            if self.dataset_config.fast_image_size:
-                # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
-                try:
-                    w, h = image_utils.get_image_size(self.path)
-                except image_utils.UnknownImageFormat:
-                    print_once(
-                        f"Warning: Some images in the dataset cannot be fast read. "
-                        + f"This process is faster for png, jpeg"
-                    )
+            is_audio_file = (
+                self.dataset_config.do_audio
+                and self.path.lower().endswith(audio_extensions)
+            )
+            if is_audio_file:
+                # Audio-only items still need synthetic dimensions for bucketing.
+                resolution = self.dataset_config.resolution
+                if isinstance(resolution, list):
+                    resolution = max(resolution)
+                w, h = int(resolution), int(resolution)
+            else:
+                if self.dataset_config.fast_image_size:
+                    # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
+                    try:
+                        w, h = image_utils.get_image_size(self.path)
+                    except image_utils.UnknownImageFormat:
+                        print_once(
+                            f"Warning: Some images in the dataset cannot be fast read. "
+                            + f"This process is faster for png, jpeg"
+                        )
+                        img = exif_transpose(Image.open(self.path))
+                        w, h = img.size
+                else:
                     img = exif_transpose(Image.open(self.path))
                     w, h = img.size
-            else:
-                img = exif_transpose(Image.open(self.path))
-                w, h = img.size
             size_database[file_key] = (w, h, file_signature)
         self.width: int = w
         self.height: int = h
@@ -187,7 +199,7 @@ class DataLoaderBatchDTO:
             )
             self.audio_data: Union[List, None] = (
                 [x.audio_data for x in self.file_items]
-                if self.file_items[0].audio_data is not None
+                if any([x.audio_data is not None for x in self.file_items])
                 else None
             )
             self.audio_tensor: Union[torch.Tensor, None] = None
@@ -198,7 +210,9 @@ class DataLoaderBatchDTO:
             self.audio_target: Union[torch.Tensor, None] = None
             self.audio_pred: Union[torch.Tensor, None] = None
 
-            if not is_latents_cached:
+            if not is_latents_cached and all(
+                [x.tensor is not None for x in self.file_items]
+            ):
                 # only return a tensor if latents are not cached
                 self.tensor: torch.Tensor = torch.cat(
                     [x.tensor.unsqueeze(0) for x in self.file_items]

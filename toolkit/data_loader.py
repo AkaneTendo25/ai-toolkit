@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+audio_extensions = ['.wav', '.mp3', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.wma']
 
 
 class RescaleTransform:
@@ -425,6 +426,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_video:
                 # only look for videos
                 extensions = video_extensions
+            elif self.dataset_config.do_audio:
+                # audio-only training datasets (e.g. ACE-Step)
+                extensions = image_extensions + audio_extensions
             file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions))]
         else:
             # assume json

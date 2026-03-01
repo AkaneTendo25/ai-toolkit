@@ -1,0 +1,55 @@
+---
+job: extension
+config:
+  name: "my_acestep_lora_v1"
+  process:
+    - type: "acestep_lora_trainer"
+
+      # Path to your local ACE-Step-1.5 repository.
+      acestep_repo_path: "G:/samples/ACE-Step-1.5"
+
+      # Runner choice:
+      # - true  -> uses: uv run train.py ...
+      # - false -> uses: <python_executable> train.py ...
+      use_uv: true
+      # python_executable: "python"
+
+      # ACE-Step subcommand: fixed, vanilla, estimate
+      subcommand: "fixed"
+      checkpoint_dir: "G:/samples/ACE-Step-1.5/checkpoints"
+      model_variant: "turbo"
+
+      # Path to ACE-Step preprocessed tensor dataset (.pt + manifest.json).
+      dataset_dir: "G:/datasets/acestep/preprocessed_tensors/my_dataset"
+      # Where ACE-Step writes LoRA checkpoints/output.
+      output_dir: "output/[name]"
+
+      # Common training params
+      adapter_type: "lora"
+      rank: 64
+      alpha: 128
+      dropout: 0.1
+      target_modules:
+        - "q_proj"
+        - "k_proj"
+        - "v_proj"
+        - "o_proj"
+
+      learning_rate: 1.0e-4
+      batch_size: 1
+      gradient_accumulation: 4
+      epochs: 100
+      save_every: 10
+      warmup_steps: 100
+      num_workers: 0
+
+      device: "auto"
+      precision: "auto"
+
+      # If true, pass --yes to ACE-Step so it skips its confirmation prompt.
+      yes: true
+
+      # Extra passthrough CLI args appended as-is at the end.
+      # extra_args:
+      #   - "--sample-every-n-epochs"
+      #   - "5"

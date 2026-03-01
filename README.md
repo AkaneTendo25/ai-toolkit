@@ -348,6 +348,78 @@ from the last checkpoint.
 
 IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
 
+## ACE-Step LoRA
+
+AI Toolkit supports two ACE-Step training paths:
+
+1. Native diffusers model path (`arch: "acestep"`) for `sd_trainer`
+2. Bridge process that shells out to ACE-Step's original `train.py`
+
+### Native diffusers path (recommended)
+
+Files:
+
+- Model: `extensions_built_in/diffusion_models/acestep/acestep.py`
+- Example config: `config/examples/train_lora_acestep_diffusers.yaml`
+- Converter script: `scripts/convert_ace_step_to_diffusers.py`
+
+As of this writing, ACE-Step diffusers support is in PR form:
+
+- https://github.com/huggingface/diffusers/pull/13095
+
+So you need a diffusers build that contains:
+
+- `AceStepPipeline`
+- `AceStepConditionEncoder`
+- `AceStepDiTModel`
+
+Example install (until PR is merged):
+
+```bash
+pip uninstall -y diffusers
+pip install git+https://github.com/ChuxiJ/diffusers@8c2db469b7efeed45ec244f66f0d9678f90a9924
+```
+
+#### Convert original ACE-Step checkpoints to diffusers layout
+
+```bash
+python scripts/convert_ace_step_to_diffusers.py \
+  --checkpoint_dir /path/to/ACE-Step-1.5/checkpoints \
+  --dit_config acestep-v15-turbo \
+  --output_dir /path/to/ACE-Step-v1-5-turbo-diffusers \
+  --dtype bf16
+```
+
+#### Train with ai-toolkit
+
+```bash
+python run.py config/examples/train_lora_acestep_diffusers.yaml
+```
+
+Notes:
+
+- For audio datasets, set `datasets[].do_audio: true`.
+- Captions can include both prompt and lyrics using `|||` separator:
+  - `prompt text ||| [verse]\nlyrics...`
+- Output samples can be written as `.wav` by setting `sample.format: "wav"`.
+
+### Bridge path (fallback)
+
+Process type: `acestep_lora_trainer` in `extensions_built_in/acestep_lora`
+
+Example configs:
+
+- `config/examples/train_lora_acestep_fixed.yaml`
+- `config/examples/train_lora_acestep_vanilla.yaml`
+- `config/examples/train_lora_acestep_estimate.yaml`
+- `config/examples/train_lora_acestep_smoke_test.yaml`
+
+Smoke test:
+
+```bash
+python run.py config/examples/train_lora_acestep_smoke_test.yaml
+```
+
 ### Need help?
 
 Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)

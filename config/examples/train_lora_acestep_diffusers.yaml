@@ -1,0 +1,62 @@
+---
+job: extension
+config:
+  name: "my_first_acestep_lora_v1"
+  process:
+    - type: "sd_trainer"
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/audio/folder"
+          caption_ext: "txt"
+          # Audio files must have a matching caption file:
+          # song_001.wav + song_001.txt
+          do_audio: true
+          cache_latents_to_disk: false
+          resolution: 512
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+      model:
+        # Path or HF repo of an ACE-Step model converted to diffusers format.
+        name_or_path: "/path/to/ACE-Step-v1-5-turbo-diffusers"
+        arch: "acestep"
+        model_kwargs:
+          # If true, caption text is used as both prompt and lyrics.
+          use_caption_as_lyrics: true
+          # You can split caption + lyrics with this separator:
+          # "prompt text ||| [verse]\nlyrics..."
+          lyrics_separator: "|||"
+          prompt_audio_duration: 30.0
+          vocal_language: "en"
+      sample:
+        sampler: "flowmatch"
+        sample_every: 500
+        format: "wav"
+        prompts:
+          - "upbeat electronic pop with female vocals"
+          - "cinematic orchestral ballad with choir"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 6.0
+        sample_steps: 8
+meta:
+  name: "[name]"
+  version: "1.0"

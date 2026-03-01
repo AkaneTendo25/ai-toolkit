@@ -1,0 +1,23 @@
+---
+job: extension
+config:
+  name: "my_acestep_estimate_v1"
+  process:
+    - type: "acestep_lora_trainer"
+      acestep_repo_path: "G:/samples/ACE-Step-1.5"
+      use_uv: true
+      subcommand: "estimate"
+      checkpoint_dir: "G:/samples/ACE-Step-1.5/checkpoints"
+      model_variant: "turbo"
+      dataset_dir: "G:/datasets/acestep/preprocessed_tensors/my_dataset"
+
+      device: "auto"
+      precision: "auto"
+      batch_size: 1
+      num_workers: 0
+
+      estimate_batches: 8
+      top_k: 16
+      granularity: "module"
+      estimate_output: "output/[name]/estimate_results.json"
+      yes: true
