@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SWEEP META-CONFIG  –  A/B LoRA training parameter sweep
+#
+# Usage (from ai-toolkit root on Linux):
+#   python run_sweep.py config/examples/sweep_example.yaml
+#   python run_sweep.py config/examples/sweep_example.yaml --dry-run
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Path to your base training config.
+# Can be absolute or relative to this sweep file's directory.
+base_config: "/home/user/workspace/lora_base.yaml"
+
+# Root directory where the sweep runner will write:
+#   sweep_dir/configs/   – one generated YAML per run
+#   sweep_dir/runs/      – training output (checkpoints, samples, etc.)
+#   sweep_dir/logs/      – per-run log files (if log_dir is not overridden)
+sweep_dir: "/home/user/workspace/sweeps/lr_rank_sweep"
+
+# How to combine the sweep parameters below:
+#   "product"  → cartesian product  (e.g. 3 LRs × 3 ranks = 9 runs)
+#   "zip"      → parallel lists     (same index paired together; all lists must have same length)
+mode: "product"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SWEEP PARAMETERS
+#
+# Each entry has a "param" (dot-notation path relative to config.process[0])
+# and one of:
+#   values:   [a, b, c, ...]             explicit list
+#   range:    {from: X, to: Y, step: S}  inclusive integer or float range
+#   linspace: {from: X, to: Y, n: N}    N evenly-spaced values
+# ─────────────────────────────────────────────────────────────────────────────
+sweep:
+  # Sweep learning rate across 3 values → 3 variants
+  - param: "train.lr"
+    values: [1.0e-5, 5.0e-5, 1.0e-4]
+
+  # Sweep LoRA rank: 8, 16, 32 → combined with above gives 9 runs total
+  - param: "network.linear"
+    range:
+      from: 8
+      to: 32
+      step: 8
+  # NOTE: network.linear_alpha will keep its value from the base config.
+  # If you want it to always match the rank, add it to sweep too with the same values.
+
+  # Uncomment to also sweep alpha alongside rank (use "zip" mode for this):
+  # - param: "network.linear_alpha"
+  #   range:
+  #     from: 8
+  #     to: 32
+  #     step: 8
+
+  # Example: sweep batch size
+  # - param: "train.batch_size"
+  #   values: [1, 2, 4]
+
+  # Example: sweep optimizer
+  # - param: "train.optimizer"
+  #   values: ["adamw8bit", "prodigy"]
+
+  # Example: sweep caption dropout
+  # - param: "datasets.0.caption_dropout_rate"   # access first dataset in list
+  #   values: [0.0, 0.05, 0.1]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIXED OVERRIDES
+#
+# Applied to every run before sweep params are applied.
+# Useful for quick global adjustments without editing the base config.
+# Same dot-notation syntax as sweep params.
+# ─────────────────────────────────────────────────────────────────────────────
+fixed_overrides:
+  train.steps: 1000
+  save.save_every: 250
+  save.max_step_saves_to_keep: 4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+options:
+  # Continue to the next run even if the current one fails.
+  recover: true
+
+  # Set to true to generate configs and print the plan without starting training.
+  dry_run: false
+
+  # Directory for per-run log files. null → no log files.
+  # Relative paths are resolved from this sweep file's directory.
+  log_dir: null
