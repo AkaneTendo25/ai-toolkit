@@ -17,6 +17,15 @@ config:
         type: "lora"
         linear: 16
         linear_alpha: 16
+        # Training-only OrthoLORA projection for mixed batches. Inference stays standard LoRA.
+        # network_kwargs:
+        #   enable_ortholora: true
+        #   # valid values: dataset, dataset_path, folder_path, media_type, is_reg
+        #   ortholora_group_by: dataset
+        #   # at least two active groups are required before projection runs
+        #   ortholora_min_active_groups: 2
+        #   ortholora_min_group_samples: 1
+        #   ortholora_log_metrics: true
       save:
         dtype: float16 # precision to save
         save_every: 250 # save every this many steps

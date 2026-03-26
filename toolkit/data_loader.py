@@ -23,6 +23,7 @@ from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingM
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
+from toolkit.ortholora_task_sampler import TaskWindowBatchSampler, TaskWindowIndexSampler
 
 import platform
 
@@ -385,8 +386,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             dataset_config: 'DatasetConfig',
             batch_size=1,
             sd: 'StableDiffusion' = None,
+            ortholora_task_index: int | None = None,
     ):
         self.dataset_config = dataset_config
+        self.ortholora_task_index = ortholora_task_index
         # update bucket divisibility
         self.dataset_config.bucket_tolerance = sd.get_bucket_divisibility()
         self.is_video = dataset_config.num_frames > 1
@@ -598,6 +601,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
     def _get_single_item(self, index) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        file_item.ortholora_task_index = self.ortholora_task_index
         file_item.load_and_process_image(self.transform)
         file_item.load_caption(self.caption_dict)
         return file_item
@@ -621,6 +625,7 @@ def get_dataloader_from_datasets(
         dataset_options,
         batch_size=1,
         sd: 'StableDiffusion' = None,
+        ortholora_accumulation_steps: int | None = None,
 ) -> DataLoader:
     if dataset_options is None or len(dataset_options) == 0:
         return None
@@ -640,10 +645,15 @@ def get_dataloader_from_datasets(
             for x in split_configs:
                 dataset_config_list.append(DatasetConfig(**x))
 
-    for config in dataset_config_list:
+    for dataset_idx, config in enumerate(dataset_config_list):
 
         if config.type == 'image':
-            dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
+            dataset = AiToolkitDataset(
+                config,
+                batch_size=batch_size,
+                sd=sd,
+                ortholora_task_index=dataset_idx,
+            )
             datasets.append(dataset)
             if config.buckets:
                 has_buckets = True
@@ -674,7 +684,36 @@ def get_dataloader_from_datasets(
         dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers
         dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
 
-    if has_buckets:
+    if ortholora_accumulation_steps is not None:
+        if has_buckets:
+            sampler = TaskWindowIndexSampler(
+                dataset_group=concatenated_dataset,
+                accumulation_steps=int(ortholora_accumulation_steps),
+                seed=0,
+            )
+            data_loader = DataLoader(
+                concatenated_dataset,
+                batch_size=None,  # we batch in the datasets for now
+                drop_last=False,
+                shuffle=False,
+                sampler=sampler,
+                collate_fn=dto_collation,
+                **dataloader_kwargs
+            )
+        else:
+            batch_sampler = TaskWindowBatchSampler(
+                dataset_group=concatenated_dataset,
+                batch_size=batch_size,
+                accumulation_steps=int(ortholora_accumulation_steps),
+                seed=0,
+            )
+            data_loader = DataLoader(
+                concatenated_dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=dto_collation,
+                **dataloader_kwargs
+            )
+    elif has_buckets:
         # make sure they all have buckets
         for dataset in datasets:
             assert dataset.dataset_config.buckets, f"buckets not found on dataset {dataset.dataset_config.folder_path}, you either need all buckets or none"

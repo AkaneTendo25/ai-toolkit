@@ -23,6 +23,7 @@ from toolkit.custom_adapter import CustomAdapter
 from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
+from toolkit.ortholora import OrthoLoRAHelper
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma
@@ -113,6 +114,43 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+        network_kwargs = {}
+        if self.network_config is not None and self.network_config.network_kwargs is not None:
+            network_kwargs = self.network_config.network_kwargs
+        self.ortholora_helper = OrthoLoRAHelper(network_kwargs)
+        self._ortholora_last_metrics = None
+        self._ortholora_warned_runtime = False
+        self._validate_ortholora_config()
+
+    def _validate_ortholora_config(self):
+        if not self.ortholora_helper.enabled:
+            return
+
+        if self.network_config is None or self.network_config.type.lower() != "lora":
+            raise ValueError("OrthoLORA requires a standard LoRA network (network.type = 'lora')")
+        if self.train_config.gradient_accumulation != 1:
+            raise ValueError("OrthoLORA requires gradient_accumulation = 1")
+        if self.train_config.gradient_accumulation_steps == -1 or self.train_config.gradient_accumulation_steps < 2:
+            raise ValueError("OrthoLORA requires gradient_accumulation_steps >= 2")
+        if self.datasets is None or len(self.datasets) < 2:
+            raise ValueError("OrthoLORA requires at least 2 non-regular datasets")
+        if self.train_config.gradient_accumulation_steps != len(self.datasets):
+            raise ValueError(
+                "OrthoLORA requires gradient_accumulation_steps to equal the number of non-regular datasets "
+                f"(got {self.train_config.gradient_accumulation_steps} vs {len(self.datasets)})"
+            )
+        if self.datasets_reg is not None and len(self.datasets_reg) > 0:
+            raise ValueError("OrthoLORA does not support regularization datasets")
+        if str(self.train_config.dtype).lower() in {"fp16", "float16"}:
+            raise ValueError("OrthoLORA does not support fp16 mixed precision")
+        if self.train_config.diff_output_preservation:
+            raise ValueError("OrthoLORA does not support diff_output_preservation")
+        if self.train_config.blank_prompt_preservation:
+            raise ValueError("OrthoLORA does not support blank_prompt_preservation")
+        if self.train_config.do_guidance_loss:
+            raise ValueError("OrthoLORA does not support guidance loss")
+        if self.train_config.loss_type == "mean_flow":
+            raise ValueError("OrthoLORA does not support loss_type = 'mean_flow'")
 
     def before_model_load(self):
         pass
@@ -478,6 +516,7 @@ class SDTrainer(BaseSDTrainProcess):
             batch: 'DataLoaderBatchDTO',
             mask_multiplier: Union[torch.Tensor, float] = 1.0,
             prior_pred: Union[torch.Tensor, None] = None,
+            return_loss_details: bool = False,
             **kwargs
     ):
         loss_target = self.train_config.loss_target
@@ -858,7 +897,8 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
-        loss = loss.mean()
+        per_sample_loss = loss
+        loss = per_sample_loss.mean()
         
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
@@ -878,8 +918,16 @@ class SDTrainer(BaseSDTrainProcess):
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
             loss = loss + norm_std_loss
 
+        total_loss = loss + additional_loss
 
-        return loss + additional_loss
+        if return_loss_details:
+            return {
+                'loss': total_loss,
+                'per_sample_loss': per_sample_loss,
+                'diffusion_loss': per_sample_loss.mean(),
+            }
+
+        return total_loss
 
     def preprocess_batch(self, batch: 'DataLoaderBatchDTO'):
         return batch
@@ -916,8 +964,7 @@ class SDTrainer(BaseSDTrainProcess):
     
     
     # ------------------------------------------------------------------
-    #  Mean-Flow loss (Geng et al., “Mean Flows for One-step Generative
-    #  Modelling”, 2025 – see Alg. 1 + Eq. (6) of the paper)
+    #  Mean-Flow loss
     # This version avoids jvp / double-back-prop issues with Flash-Attention
     # adapted from the work of lodestonerock
     # ------------------------------------------------------------------
@@ -1207,6 +1254,8 @@ class SDTrainer(BaseSDTrainProcess):
     
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+        self._ortholora_last_metrics = None
+        ortholora_metrics = []
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -1448,6 +1497,8 @@ class SDTrainer(BaseSDTrainProcess):
                 mask_multiplier_list,
                 prompt_2_list
         ):
+
+            use_ortholora = False
 
             # if self.train_config.negative_prompt is not None:
             #     # add negative prompt
@@ -1974,7 +2025,12 @@ class SDTrainer(BaseSDTrainProcess):
                         if doing_preservation and not do_inverted_masked_prior:
                             prior_to_calculate_loss = None
                         
-                        loss = self.calculate_loss(
+                        use_ortholora = (
+                            self.ortholora_helper.enabled
+                            and self.network is not None
+                            and not doing_preservation
+                        )
+                        loss_output = self.calculate_loss(
                             noise_pred=noise_pred,
                             noise=noise,
                             noisy_latents=noisy_latents,
@@ -1982,7 +2038,24 @@ class SDTrainer(BaseSDTrainProcess):
                             batch=batch,
                             mask_multiplier=mask_multiplier,
                             prior_pred=prior_to_calculate_loss,
+                            return_loss_details=use_ortholora,
                         )
+                        if use_ortholora:
+                            loss = loss_output['loss']
+                            try:
+                                self.ortholora_helper.accumulate_task_gradient(
+                                    network=self.network,
+                                    batch=batch,
+                                    per_sample_loss=loss_output['per_sample_loss'],
+                                    scalar_multiplier=loss_multiplier.mean(),
+                                )
+                            except Exception as exc:
+                                self.ortholora_helper.reset_window()
+                                if not self._ortholora_warned_runtime:
+                                    print_acc(f"OrthoLORA skipped for this step: {exc}")
+                                    self._ortholora_warned_runtime = True
+                        else:
+                            loss = loss_output
                     
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
                         # send the loss backwards otherwise checkpointing will fail
@@ -2035,6 +2108,25 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss)
 
+                    if use_ortholora and not self.is_grad_accumulation_step:
+                        try:
+                            ortholora_window_metrics = self.ortholora_helper.finalize_window()
+                            if ortholora_window_metrics is not None:
+                                ortholora_metrics.append(ortholora_window_metrics)
+                        except Exception as exc:
+                            self.ortholora_helper.reset_window()
+                            if not self._ortholora_warned_runtime:
+                                print_acc(f"OrthoLORA skipped for this step: {exc}")
+                                self._ortholora_warned_runtime = True
+        if ortholora_metrics:
+            metric_totals = OrderedDict()
+            for metrics in ortholora_metrics:
+                for key, value in metrics.items():
+                    metric_totals[key] = metric_totals.get(key, 0.0) + float(value)
+            self._ortholora_last_metrics = OrderedDict(
+                (key, value / len(ortholora_metrics)) for key, value in metric_totals.items()
+            )
+
         return loss.detach()
         # flush()
 
@@ -2044,7 +2136,15 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
-        self.optimizer.zero_grad()
+        ortholora_metric_totals = OrderedDict()
+        ortholora_metric_count = 0
+        if self.ortholora_helper.enabled:
+            if self.grad_accumulation_step == 1:
+                self.optimizer.zero_grad()
+        else:
+            self.optimizer.zero_grad()
+        if self.ortholora_helper.enabled and self.grad_accumulation_step == 1:
+            self.ortholora_helper.reset_window()
         for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
@@ -2064,6 +2164,10 @@ class SDTrainer(BaseSDTrainProcess):
                 total_loss = loss
             else:
                 total_loss += loss
+            if self._ortholora_last_metrics:
+                ortholora_metric_count += 1
+                for key, value in self._ortholora_last_metrics.items():
+                    ortholora_metric_totals[key] = ortholora_metric_totals.get(key, 0.0) + float(value)
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
 
@@ -2081,6 +2185,8 @@ class SDTrainer(BaseSDTrainProcess):
                 self.optimizer.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
+                if self.ortholora_helper.enabled:
+                    self.ortholora_helper.reset_window()
                 if self.adapter and isinstance(self.adapter, CustomAdapter):
                     self.adapter.post_weight_update()
             if self.ema is not None:
@@ -2106,6 +2212,9 @@ class SDTrainer(BaseSDTrainProcess):
         loss_dict = OrderedDict(
             {'loss': (total_loss / len(batch_list)).item()}
         )
+        if self.ortholora_helper.log_metrics and ortholora_metric_count > 0:
+            for key, value in ortholora_metric_totals.items():
+                loss_dict[key] = value / ortholora_metric_count
 
         self.end_of_training_loop()
 

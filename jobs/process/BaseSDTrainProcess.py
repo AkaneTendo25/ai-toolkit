@@ -2044,12 +2044,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         ### HOOk ###
         self.before_dataset_load()
+        ortholora_accumulation_steps = None
+        if self.network_config is not None and self.network_config.network_kwargs is not None:
+            network_kwargs = self.network_config.network_kwargs
+            ortholora_config = network_kwargs.get('ortholora', {})
+            if not isinstance(ortholora_config, dict):
+                ortholora_config = {}
+            ortholora_enabled = bool(
+                network_kwargs.get(
+                    'enable_ortholora',
+                    ortholora_config.get('enabled', False),
+                )
+            )
+            if ortholora_enabled:
+                ortholora_accumulation_steps = self.train_config.gradient_accumulation_steps
         # load datasets if passed in the root process
         if self.datasets is not None:
-            self.data_loader = get_dataloader_from_datasets(self.datasets, self.train_config.batch_size, self.sd)
+            self.data_loader = get_dataloader_from_datasets(
+                self.datasets,
+                self.train_config.batch_size,
+                self.sd,
+                ortholora_accumulation_steps=ortholora_accumulation_steps,
+            )
         if self.datasets_reg is not None:
-            self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
-                                                                self.sd)
+            self.data_loader_reg = get_dataloader_from_datasets(
+                self.datasets_reg,
+                self.train_config.batch_size,
+                self.sd,
+            )
 
         flush()
         self.last_save_step = self.step_num
