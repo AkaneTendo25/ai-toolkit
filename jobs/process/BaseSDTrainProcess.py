@@ -132,6 +132,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.lr_scheduler = None
         self.data_loader: Union[DataLoader, None] = None
         self.data_loader_reg: Union[DataLoader, None] = None
+        self.data_loader_val: Union[DataLoader, None] = None
         self.trigger_word = self.get_conf('trigger_word', None)
 
         self.guidance_config: Union[GuidanceConfig, None] = None
@@ -146,6 +147,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             raw_datasets = preprocess_dataset_raw_config(raw_datasets)
         self.datasets = None
         self.datasets_reg = None
+        self.datasets_val = None
         self.dataset_configs: List[DatasetConfig] = []
         self.params = []
         
@@ -167,6 +169,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.datasets_reg is None:
                         self.datasets_reg = []
                     self.datasets_reg.append(dataset)
+                elif getattr(dataset, 'is_val', False):
+                    if self.datasets_val is None:
+                        self.datasets_val = []
+                    self.datasets_val.append(dataset)
                 else:
                     if self.datasets is None:
                         self.datasets = []
@@ -2072,6 +2078,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.train_config.batch_size,
                 self.sd,
             )
+        if self.datasets_val is not None:
+            self.data_loader_val = get_dataloader_from_datasets(
+                self.datasets_val,
+                self.train_config.batch_size,
+                self.sd,
+            )
 
         flush()
         self.last_save_step = self.step_num
@@ -2114,6 +2126,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             dataloader_reg = None
             dataloader_iterator_reg = None
+
+        if self.data_loader_val is not None:
+            dataloader_val = self.data_loader_val
+            dataloader_iterator_val = iter(dataloader_val)
+        else:
+            dataloader_val = None
+            dataloader_iterator_val = None
 
         # zero any gradients
         optimizer.zero_grad()
@@ -2339,6 +2358,40 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.ensure_params_requires_grad()
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
+
+                    # Validation loss
+                    is_val_step = (
+                        self.train_config.val_every > 0
+                        and dataloader_val is not None
+                        and self.step_num % self.train_config.val_every == 0
+                        and self.step_num != self.start_step
+                    )
+                    if is_val_step:
+                        val_losses = []
+                        num_val_batches = min(10, len(dataloader_val)) if hasattr(dataloader_val, '__len__') else 5
+                        for _ in range(num_val_batches):
+                            try:
+                                val_batch = next(dataloader_iterator_val)
+                            except StopIteration:
+                                dataloader_iterator_val = iter(dataloader_val)
+                                trigger_dataloader_setup_epoch(dataloader_val)
+                                val_batch = next(dataloader_iterator_val)
+                            try:
+                                with torch.no_grad():
+                                    if hasattr(self, 'train_single_accumulation'):
+                                        val_loss = self.train_single_accumulation(val_batch, validate_only=True)
+                                    else:
+                                        val_loss_dict = self.hook_train_loop([val_batch])
+                                        val_loss = val_loss_dict.get('loss', 0.0) if val_loss_dict else None
+                                if val_loss is not None:
+                                    val_losses.append(val_loss.item() if hasattr(val_loss, 'item') else float(val_loss))
+                            except Exception:
+                                pass  # skip failed val batches
+                        if val_losses:
+                            avg_val_loss = sum(val_losses) / len(val_losses)
+                            print_acc(f"\n[Val] step {self.step_num}: val_loss={avg_val_loss:.4e} (avg over {len(val_losses)} batches)")
+                            if loss_dict is not None:
+                                loss_dict['val_loss'] = avg_val_loss
 
                     if self.logging_config.log_every and self.step_num % self.logging_config.log_every == 0:
                         if self.progress_bar is not None:

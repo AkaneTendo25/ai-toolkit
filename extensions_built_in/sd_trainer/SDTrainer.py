@@ -1253,7 +1253,7 @@ class SDTrainer(BaseSDTrainProcess):
         )
     
 
-    def train_single_accumulation(self, batch: DataLoaderBatchDTO):
+    def train_single_accumulation(self, batch: DataLoaderBatchDTO, validate_only: bool = False):
         self._ortholora_last_metrics = None
         ortholora_metrics = []
         with torch.no_grad():
@@ -2058,8 +2058,9 @@ class SDTrainer(BaseSDTrainProcess):
                             loss = loss_output
                     
                     if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
-                        # send the loss backwards otherwise checkpointing will fail
-                        self.accelerator.backward(loss)
+                        if not validate_only:
+                            # send the loss backwards otherwise checkpointing will fail
+                            self.accelerator.backward(loss)
                         normal_loss = loss.detach() # dont send backward again
                         
                         with torch.no_grad():
@@ -2082,12 +2083,14 @@ class SDTrainer(BaseSDTrainProcess):
                         )
                         multiplier = self.train_config.diff_output_preservation_multiplier if self.train_config.diff_output_preservation else self.train_config.blank_prompt_preservation_multiplier
                         preservation_loss = torch.nn.functional.mse_loss(preservation_pred, prior_pred) * multiplier
-                        self.accelerator.backward(preservation_loss)
+                        if not validate_only:
+                            self.accelerator.backward(preservation_loss)
 
                         loss = normal_loss + preservation_loss
                         loss = loss.clone().detach()
-                        # require grad again so the backward wont fail
-                        loss.requires_grad_(True)
+                        if not validate_only:
+                            # require grad again so the backward wont fail
+                            loss.requires_grad_(True)
                         
                 # check if nan
                 if torch.isnan(loss):
@@ -2097,16 +2100,20 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('backward'):
                     # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
                     loss = loss * loss_multiplier.mean()
-                    # IMPORTANT if gradient checkpointing do not leave with network when doing backward
-                    # it will destroy the gradients. This is because the network is a context manager
-                    # and will change the multipliers back to 0.0 when exiting. They will be
-                    # 0.0 for the backward pass and the gradients will be 0.0
-                    # I spent weeks on fighting this. DON'T DO IT
-                    # with fsdp_overlap_step_with_backward():
-                    # if self.is_bfloat:
-                    # loss.backward()
-                    # else:
-                    self.accelerator.backward(loss)
+                    if validate_only:
+                        # Validation: only compute loss, no backward pass
+                        loss = loss.detach()
+                    else:
+                        # IMPORTANT if gradient checkpointing do not leave with network when doing backward
+                        # it will destroy the gradients. This is because the network is a context manager
+                        # and will change the multipliers back to 0.0 when exiting. They will be
+                        # 0.0 for the backward pass and the gradients will be 0.0
+                        # I spent weeks on fighting this. DON'T DO IT
+                        # with fsdp_overlap_step_with_backward():
+                        # if self.is_bfloat:
+                        # loss.backward()
+                        # else:
+                        self.accelerator.backward(loss)
 
                     if use_ortholora and not self.is_grad_accumulation_step:
                         try:

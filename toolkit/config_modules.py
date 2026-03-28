@@ -386,6 +386,7 @@ class TrainConfig:
         self.noise_offset = kwargs.get('noise_offset', 0.0)
         self.skip_first_sample = kwargs.get('skip_first_sample', False)
         self.force_first_sample = kwargs.get('force_first_sample', False)
+        self.val_every: int = kwargs.get('val_every', 0)  # 0 = disabled
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
         self.weight_jitter = kwargs.get('weight_jitter', 0.0)
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
@@ -873,6 +874,7 @@ class DatasetConfig:
         self.buckets: bool = kwargs.get('buckets', True)
         self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
         self.is_reg: bool = kwargs.get('is_reg', False)
+        self.is_val: bool = kwargs.get('is_val', False)
         self.prior_reg: bool = kwargs.get('prior_reg', False)
         self.network_weight: float = float(kwargs.get('network_weight', 1.0))
         self.token_dropout_rate: float = float(kwargs.get('token_dropout_rate', 0.0))
