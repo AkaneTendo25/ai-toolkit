@@ -2381,8 +2381,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     if hasattr(self, 'train_single_accumulation'):
                                         val_loss = self.train_single_accumulation(val_batch, validate_only=True)
                                     else:
-                                        val_loss_dict = self.hook_train_loop([val_batch])
-                                        val_loss = val_loss_dict.get('loss', 0.0) if val_loss_dict else None
+                                        # Fallback: skip val for trainers without validate_only support
+                                        val_loss = None
                                 if val_loss is not None:
                                     val_losses.append(val_loss.item() if hasattr(val_loss, 'item') else float(val_loss))
                             except Exception:
