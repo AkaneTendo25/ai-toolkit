@@ -190,8 +190,10 @@ class Wan2214bModel(Wan21):
 
         self.is_multistage = True
         # multistage boundaries split the models up when sampling timesteps
-        # for wan 2.2 14b. the timesteps are 1000-875 for transformer 1 and 875-0 for transformer 2
-        self.multistage_boundaries: List[float] = [0.875, 0.0]
+        # Default: 0.875 for T2V, 0.9 for I2V. Configurable via model_kwargs.boundary_ratio
+        default_boundary = boundary_ratio_i2v if "i2v" in model_config.arch.lower() else boundary_ratio_t2v
+        boundary = model_config.model_kwargs.get("boundary_ratio", default_boundary)
+        self.multistage_boundaries: List[float] = [boundary, 0.0]
 
         self.train_high_noise = model_config.model_kwargs.get("train_high_noise", True)
         self.train_low_noise = model_config.model_kwargs.get("train_low_noise", True)
@@ -347,10 +349,10 @@ class Wan2214bModel(Wan21):
             transformer_2=transformer_2,
             torch_dtype=self.torch_dtype,
             device=self.device_torch,
-            boundary_ratio=boundary_ratio_t2v,
+            boundary_ratio=self.multistage_boundaries[0],
             low_vram=self.model_config.low_vram,
         )
-        
+
         if self.model_config.quantize and self.model_config.accuracy_recovery_adapter is not None:
             # apply the accuracy recovery adapter to both transformers
             self.print_and_status_update("Applying Accuracy Recovery Adapter to Transformers")
@@ -386,8 +388,7 @@ class Wan2214bModel(Wan21):
             expand_timesteps=self._wan_expand_timesteps,
             device=self.device_torch,
             aggressive_offload=self.model_config.low_vram,
-            # todo detect if it is i2v or t2v
-            boundary_ratio=boundary_ratio_t2v,
+            boundary_ratio=self.multistage_boundaries[0],
         )
 
         # pipeline = pipeline.to(self.device_torch)
