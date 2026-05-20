@@ -1,0 +1,94 @@
+---
+# Orthogonal Adaptation (OrthA) example — Po et al., CVPR 2024 (arXiv 2312.02432).
+#
+# OrthA replaces the standard Kaiming init of `lora_down` with a frozen
+# orthonormal row-subset of a shared basis, so when several adapters from
+# different concepts are merged later (e.g. via diffusers
+# `pipe.set_adapters([a, b], weights=[w_a, w_b])`) their down-projections are
+# mutually orthogonal and per-concept residuals do not bleed into each other.
+#
+# Usage for multi-concept training:
+#   1. Train one adapter per concept with the same `master_seed` (so they share
+#      a basis) and a *different* `seed` (so each picks a different row subset).
+#   2. At inference, load both LoRAs into the same pipeline and call
+#      `pipe.set_adapters([a, b], weights=[w_a, w_b])`. Note that diffusers
+#      treats `weights=` as absolute multipliers on ΔW (not normalized); for a
+#      FedAvg-equivalent merge of N concepts, set w_i = α_i / N.
+#
+# Caveats:
+#   - `scale: 0.5` reproduces the reference HF Space implementation. For larger
+#     backbones (Qwen-Image dim≥2048, bf16) sweep [0.25, 0.5, 1.0, 1/sqrt(rank)]
+#     if merge quality regresses.
+#   - Conv2d weights are not patched (warning is logged and Kaiming init kept).
+#   - Resuming via `pretrained_lora_path` works: lora_down is re-frozen on init
+#     and again before the optimizer step, so trained values restored from the
+#     checkpoint stay frozen.
+
+job: extension
+config:
+  name: "my_first_qwen_image_ortha_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 32          # OrthA halves trainable params (B is frozen),
+        linear_alpha: 32    # so a slightly higher rank than vanilla LoRA helps.
+        network_kwargs:
+          ortha:
+            enabled: true
+            seed: 42                 # CHANGE THIS for each concept (e.g. 42, 43, 44, ...)
+            scale: 0.5               # multiplier on the frozen rows; sweep if needed
+            basis_dir: "./ortha_bases"  # bases cached as ortha_basis_{n}_seed{master_seed}.pt
+            master_seed: 12345       # KEEP THE SAME across all concepts to be merged
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+      train:
+        batch_size: 1
+        cache_text_embeddings: true
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+      model:
+        name_or_path: "Qwen/Qwen-Image"
+        arch: "qwen_image"
+        quantize: true
+        qtype: "uint3|ostris/accuracy_recovery_adapters/qwen_image_torchao_uint3.safetensors"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: true
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "woman with red hair, playing chess at the park, bomb going off in the background"
+          - "a woman holding a coffee cup, in a beanie, sitting at a cafe"
+          - "a man showing off his cool new t shirt at the beach, a shark is jumping out of the water in the background"
+          - "photo of a man, white background, medium shot, modeling clothing, studio lighting, white backdrop"
+          - "a man holding a sign that says, 'this is a sign'"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 3
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'

@@ -1299,6 +1299,65 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # get noise
                 noise = self.get_noise(latents, batch_size, dtype=dtype, batch=batch, timestep=timesteps)
 
+                # MuDI mean-shifted noise initialization (Jang et al. §3.2).
+                # If a per-subject mean latent dict has been loaded (toolkit/mudi.py
+                # helpers + offline precompute), bias each batch item's noise toward
+                # its subject's mean latent. Skipped per-sample when subject_id is
+                # unknown or when the sample was Seg-Mix collaged (two subjects).
+                _mudi_means = getattr(self, '_mudi_mean_latents', None)
+                _mudi_alpha = getattr(self, '_mudi_mean_shift_alpha', 0.0)
+                if _mudi_means and _mudi_alpha > 0.0:
+                    from toolkit.mudi import extract_subject_id, mean_shifted_noise
+                    import torch.nn.functional as _F
+                    pattern = getattr(self, '_mudi_subject_id_pattern', 'parent_dir')
+                    for i in range(noise.shape[0]):
+                        if i >= len(batch.file_items):
+                            break
+                        fi = batch.file_items[i]
+                        if getattr(fi, '_is_segmix', False):
+                            continue  # collaged sample = two subjects, skip mean-shift
+                        sid = extract_subject_id(fi.path, pattern)
+                        if not sid or sid not in _mudi_means:
+                            continue
+                        ref = _mudi_means[sid]  # [16, 1, 128, 128] precomputed at 1024^2 (5D w/ T=1)
+                        target = noise[i]      # current bucket size; usually [16, H, W] for image
+                        # Bring ref to spatial layout matching target.
+                        # ref is [C, T, H_ref, W_ref]; target may be [C, H, W] (4D batch) or [C, T, H, W] (5D video).
+                        if ref.dim() == 4 and target.dim() == 3:
+                            # squeeze the T=1 dim of ref to match image target
+                            ref_2d_spatial = ref.squeeze(1)         # [C, H_ref, W_ref]
+                            if ref_2d_spatial.shape[-2:] != target.shape[-2:]:
+                                ref_4d = ref_2d_spatial.unsqueeze(0)  # [1, C, H_ref, W_ref]
+                                ref_4d = _F.interpolate(
+                                    ref_4d.float(), size=target.shape[-2:],
+                                    mode='bilinear', align_corners=False,
+                                )
+                                ref_2d_spatial = ref_4d.squeeze(0)
+                            ref_use = ref_2d_spatial
+                        elif ref.dim() == 4 and target.dim() == 4:
+                            # video target [C, T, H, W]; assume single-frame ref broadcasts
+                            ref_use = ref
+                            if ref_use.shape[-2:] != target.shape[-2:]:
+                                # interpolate spatial only
+                                ref_4d = ref_use.squeeze(1).unsqueeze(0)
+                                ref_4d = _F.interpolate(
+                                    ref_4d.float(), size=target.shape[-2:],
+                                    mode='bilinear', align_corners=False,
+                                )
+                                ref_use = ref_4d.squeeze(0).unsqueeze(1).expand(-1, target.shape[1], -1, -1)
+                        else:
+                            # unexpected layout; skip with warning once
+                            if not getattr(self, '_mudi_shape_warned', False):
+                                print_acc(
+                                    f"[MuDI mean-shift] WARN: unexpected noise/ref shape "
+                                    f"(noise={tuple(target.shape)}, ref={tuple(ref.shape)}); "
+                                    f"skipping mean-shift for this batch."
+                                )
+                                self._mudi_shape_warned = True
+                            continue
+                        ref_dev = ref_use.to(device=noise.device, dtype=noise.dtype)
+                        noise[i] = mean_shifted_noise(target, ref_dev, _mudi_alpha)
+
                 # add dynamic noise offset. Dynamic noise is offsetting the noise to the same channelwise mean as the latents
                 # this will negate any noise offsets
                 if self.train_config.dynamic_noise_offset and not is_reg:
@@ -2062,6 +2121,37 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.sd,
                 ortholora_accumulation_steps=ortholora_accumulation_steps,
             )
+            # MuDI mean-shifted noise: scan datasets for a seg_mix
+            # config with mean_shift_alpha > 0 and load the precomputed mean
+            # latents dict once at startup. Multiple datasets can share the
+            # same path; if they disagree on alpha, the first dataset wins.
+            self._mudi_mean_latents = None
+            self._mudi_mean_shift_alpha = 0.0
+            self._mudi_subject_id_pattern = "parent_dir"
+            for ds_cfg in self.datasets:
+                seg_mix = getattr(ds_cfg, "seg_mix", None)
+                if not seg_mix:
+                    continue
+                from toolkit.mudi import MuDIConfig
+                mudi_cfg = MuDIConfig.from_dict(seg_mix)
+                if mudi_cfg is None or not mudi_cfg.enabled:
+                    continue
+                if mudi_cfg.mean_shift_alpha > 0.0 and mudi_cfg.mean_latents_path:
+                    import torch as _torch
+                    print_acc(
+                        f"[MuDI mean-shift] loading mean latents from "
+                        f"{mudi_cfg.mean_latents_path} (alpha={mudi_cfg.mean_shift_alpha})"
+                    )
+                    self._mudi_mean_latents = _torch.load(
+                        mudi_cfg.mean_latents_path, map_location="cpu"
+                    )
+                    self._mudi_mean_shift_alpha = mudi_cfg.mean_shift_alpha
+                    self._mudi_subject_id_pattern = mudi_cfg.subject_id_pattern
+                    print_acc(
+                        f"[MuDI mean-shift] loaded {len(self._mudi_mean_latents)} "
+                        f"mean latents: {sorted(self._mudi_mean_latents.keys())}"
+                    )
+                    break
         if self.datasets_reg is not None:
             self.data_loader_reg = get_dataloader_from_datasets(
                 self.datasets_reg,

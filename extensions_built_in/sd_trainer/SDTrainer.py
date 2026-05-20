@@ -24,6 +24,12 @@ from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.ortholora import OrthoLoRAHelper
+from toolkit.tara import (
+    TARAConfig,
+    TARAController,
+    tokenize_and_locate,
+    tokenize_and_locate_batch,
+)
 from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma
@@ -118,6 +124,23 @@ class SDTrainer(BaseSDTrainProcess):
         self._ortholora_warned_runtime = False
         self._validate_ortholora_config()
 
+        # TARA (Token-Aware LoRA, Peng et al., AAAI 2026): per-batch token
+        # mask + alignment loss. The TARALoRAModule subclass on every wrapped
+        # text-stream Linear consults TARAController for the mask; this
+        # trainer is responsible for setting it before each forward and for
+        # combining L_align into the total loss.
+        self.tara_config: Optional[TARAConfig] = TARAConfig.from_dict(
+            network_kwargs.get("tara") if network_kwargs is not None else None
+        )
+        # TARA + MuDI compatibility: MuDI rewrites captions on the fly into
+        # "<a> and <b>" form which usually drops the class anchor TARA
+        # needs to locate. Rather than raising at init time (which would
+        # require crawling the still-unbuilt dataset config), we let the
+        # tokenize hook below catch ValueError from tokenize_and_locate_batch
+        # and fall through gracefully on those samples — TARA is then a
+        # no-op for the Seg-Mix sample but training proceeds.
+        self._tara_template_autodetect_done = False
+
     def _validate_ortholora_config(self):
         if not self.ortholora_helper.enabled:
             return
@@ -148,9 +171,192 @@ class SDTrainer(BaseSDTrainProcess):
         if self.train_config.loss_type == "mean_flow":
             raise ValueError("OrthoLORA does not support loss_type = 'mean_flow'")
 
+    def _autodetect_tara_template(self) -> None:
+        """Populate ``tara_config.prompt_template`` and ``template_drop_idx``
+        from the underlying diffusers pipeline if the user did not set them
+        explicitly. Qwen-Image and a few other MM-DiT pipelines wrap every
+        prompt in a system/user chat template and then drop the system
+        prefix before passing embeds to the transformer; without this
+        information the per-prompt mask has the wrong token-axis length and
+        every text-stream LoRA layer falls into the pass-through branch.
+        """
+        if self._tara_template_autodetect_done:
+            return
+        self._tara_template_autodetect_done = True
+        cfg = getattr(self, "tara_config", None)
+        if cfg is None or not cfg.enabled:
+            return
+        if cfg.prompt_template is not None:
+            return  # user-supplied; trust it.
+        pipeline = getattr(self.sd, "pipeline", None)
+        if pipeline is None:
+            return
+        template = getattr(pipeline, "prompt_template_encode", None)
+        drop_idx = getattr(pipeline, "prompt_template_encode_start_idx", None)
+        if template is None or drop_idx is None or int(drop_idx) <= 0:
+            return
+        cfg.prompt_template = str(template)
+        cfg.template_drop_idx = int(drop_idx)
+        print_acc(
+            f"[TARA] auto-detected pipeline prompt template "
+            f"(drop_idx={cfg.template_drop_idx}); per-prompt masks will be "
+            f"sized to the post-drop runtime length."
+        )
+
+    def _setup_tara_inference_mask(self, prompts: List[str]) -> bool:
+        """Tokenize ``prompts`` and prime ``TARAController`` with a per-sample
+        token-axis mask for sample-time generation.
+
+        Returns ``True`` if the mask was set (TARA active for this sample run),
+        ``False`` if TARA is disabled or tokenization could not locate the
+        rare/class anchors in every prompt — in that case the caller should
+        run sampling without TARA so prompts that lack the anchors still
+        generate as standard LoRA forwards.
+
+        At inference ``TARALoRAModule.forward`` only consumes ``get_mask()`` —
+        capture is never enabled here. The mask is built on the conditional
+        prompts only; under CFG the forward path replicates per-sample masks
+        across the cond/uncond batch via ``repeat_interleave`` so a [B, T]
+        mask broadcasts correctly to a [2B, T] runtime batch.
+        """
+        if not (
+            getattr(self, "tara_config", None) is not None
+            and self.tara_config.enabled
+        ):
+            return False
+        if not prompts:
+            return False
+        tara_tokenizer = self.sd.tokenizer
+        if isinstance(tara_tokenizer, list):
+            tara_tokenizer = tara_tokenizer[0]
+        if tara_tokenizer is None:
+            print_acc(
+                "[TARA] inference: self.sd.tokenizer is None; skipping TARA "
+                "for this sample run."
+            )
+            return False
+        self._autodetect_tara_template()
+        try:
+            rare_idx, class_idx, mask = tokenize_and_locate_batch(
+                tara_tokenizer,
+                prompts,
+                self.tara_config.rare_token,
+                self.tara_config.class_token,
+                prompt_template=self.tara_config.prompt_template,
+                template_drop_idx=self.tara_config.template_drop_idx,
+            )
+        except ValueError as e:
+            # A sample prompt may legitimately omit the class anchor (eval
+            # prompts that test pure-rare-token behavior, or distractor
+            # prompts in confusion-matrix sweeps). Fall back to standard
+            # forward; the LoRA still applies, just without TFM masking.
+            if not getattr(self, "_tara_inference_warning_emitted", False):
+                print_acc(
+                    f"[TARA] inference tokenize_and_locate_batch failed "
+                    f"({e}); sampling without TARA mask. This is expected "
+                    f"if some sample prompts omit the class anchor."
+                )
+                self._tara_inference_warning_emitted = True
+            return False
+        TARAController.enable_capture(False)
+        TARAController.clear_buffer()
+        TARAController.set_token_indices(rare_idx, class_idx, int(mask.shape[-1]))
+        TARAController.set_mask(
+            mask,
+            device=self.device_torch,
+            dtype=get_torch_dtype(self.train_config.dtype),
+        )
+        return True
+
+    def _clear_tara_inference_mask(self) -> None:
+        if not (
+            getattr(self, "tara_config", None) is not None
+            and self.tara_config.enabled
+        ):
+            return
+        TARAController.enable_capture(False)
+        TARAController.clear_buffer()
+        TARAController._mask = None
+
+    def sample(self, step=None, is_first=False):
+        """Sample-time wrapper that primes ``TARAController`` with the
+        per-prompt token mask before delegating to the base sample loop.
+
+        For TARA-trained networks this is the inference-side counterpart of
+        the training-side hook in ``train_single_accumulation``: without it,
+        ``TARALoRAModule.forward`` falls through to standard LoRA behavior
+        and the token-aware delta-injection that TARA was trained to perform
+        is never applied at generation time.
+
+        Non-TARA runs go straight to the parent implementation.
+        """
+        if not (
+            getattr(self, "tara_config", None) is not None
+            and self.tara_config.enabled
+        ):
+            return super().sample(step, is_first)
+        sample_config = self.first_sample_config if is_first else self.sample_config
+        if sample_config is None or not sample_config.prompts:
+            return super().sample(step, is_first)
+        # The trigger word is auto-injected later by the base sample(); we
+        # also do that here so the tokenizer sees the same string the
+        # diffusion forward will see, otherwise V*-position indices would
+        # not match the runtime encoder_hidden_states layout.
+        prompts_for_tokenize: List[str] = []
+        for p in sample_config.prompts:
+            if self.trigger_word is not None:
+                p = self.sd.inject_trigger_into_prompt(
+                    p, self.trigger_word, add_if_not_present=False
+                )
+            prompts_for_tokenize.append(p)
+        applied = self._setup_tara_inference_mask(prompts_for_tokenize)
+        # ai-toolkit caches sample-prompt embeds with the LITERAL "[trigger]"
+        # placeholder (cache_sample_prompts runs once at startup, before the
+        # trigger substitution happens in BaseSDTrainProcess.sample). For
+        # TARA the per-prompt token-axis mask was built against the
+        # *substituted* prompt ("Alice Smith …"), so it would mismatch the
+        # placeholder-encoded cache by a few tokens and the LoRA delta
+        # would silently fall into the pass-through branch on every text-
+        # stream layer. Bypassing the cache forces ``generate_images`` to
+        # re-encode the substituted prompt, which is the prompt our mask
+        # was sized for. Without this, sample-time TARA is a no-op.
+        saved_cache = getattr(self.sd, "sample_prompts_cache", None)
+        try:
+            if applied and saved_cache is not None:
+                self.sd.sample_prompts_cache = None
+            super().sample(step, is_first)
+            # Verify the mask actually fired on text-stream layers — if the
+            # apply counter is zero after a generation run we know TARA
+            # silently pass-throughed for every layer (mask never matched
+            # the runtime token-axis on any conditional forward) and the
+            # sampled images carry no TARA effect. Surface this loudly so
+            # it does not get buried in tqdm output.
+            if applied:
+                applied_count = TARAController.get_mask_apply_count()
+                passthrough_count = TARAController.get_mask_passthrough_count()
+                print_acc(
+                    f"[TARA] sample run summary: mask applied {applied_count}× "
+                    f"on text-stream layers, pass-through {passthrough_count}× "
+                    f"(image-stream + uncond-CFG forwards). "
+                    + (
+                        ""
+                        if applied_count > 0
+                        else "WARNING: mask never applied on the conditional "
+                        "forward — TARA is a no-op for this generation. "
+                        "Check that the trainer's tokenize_and_locate is "
+                        "template-aware and that sample_prompts_cache was "
+                        "bypassed or rebuilt with substituted triggers."
+                    )
+                )
+        finally:
+            if applied and saved_cache is not None:
+                self.sd.sample_prompts_cache = saved_cache
+            if applied:
+                self._clear_tara_inference_mask()
+
     def before_model_load(self):
         pass
-    
+
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
@@ -939,6 +1145,49 @@ class SDTrainer(BaseSDTrainProcess):
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
             loss = loss + norm_std_loss
 
+        # TARA L_align: pull K(V*) toward K(class) on every text-stream
+        # layer that recorded a buffer entry this step. Capture is disabled
+        # immediately after consumption so any subsequent forward (sampling,
+        # validation, prior prediction) cannot push stale K-vectors into the
+        # next step's loss. The buffer is reseeded by the per-step tokenize
+        # hook in train_single_accumulation.
+        if (
+            getattr(self, "tara_config", None) is not None
+            and self.tara_config.enabled
+            and TARAController.is_capture_active()
+        ):
+            tal_loss = TARAController.compute_tal_loss().to(loss.device)
+            additional_loss = additional_loss + self.tara_config.lambda_align * tal_loss
+            # Do NOT disable capture here — gradient checkpointing replays
+            # the forward during the upcoming backward, and a False flag
+            # would skip the capture branch on the replay, producing a
+            # different tensor count than the original forward (PyTorch
+            # raises ``CheckpointError: A different number of tensors was
+            # saved during the original forward and recomputation``).
+            # Capture is reset on the NEXT step's ``set_mask`` /
+            # ``clear_buffer`` calls in ``train_single_accumulation``,
+            # which is the correct per-step boundary. Validation and
+            # sampling paths set capture False themselves before running.
+            # Verbose log every N steps (or always for the first few) so a
+            # developer can confirm the training-side TARA mask actually
+            # fired on text-stream layers and the loss shifted accordingly.
+            # Set ``self._tara_train_log_every`` (default 50) on the trainer
+            # to control cadence.
+            train_log_every = getattr(self, "_tara_train_log_every", 50)
+            step_for_log = getattr(self, "step_num", 0) or 0
+            if (
+                step_for_log < 5
+                or (train_log_every > 0 and step_for_log % train_log_every == 0)
+            ):
+                applied = TARAController.get_mask_apply_count()
+                passthrough = TARAController.get_mask_passthrough_count()
+                print_acc(
+                    f"[TARA] step={step_for_log} TAL={float(tal_loss):.4e} "
+                    f"mask_applied={applied}× passthrough={passthrough}× "
+                    + ("(mask is firing on text-stream layers)" if applied > 0
+                       else "(WARNING: mask never fired — TAL loss has no effect)")
+                )
+
         total_loss = loss + additional_loss
 
         if return_loss_details:
@@ -1297,6 +1546,94 @@ class SDTrainer(BaseSDTrainProcess):
                     self.sd.text_encoder.to(self.sd.te_torch_dtype)
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+
+            # TARA: tokenize every prompt in the batch, build a per-sample
+            # token-axis mask plus per-sample V*/class indices, and enable
+            # capture so each text-stream LoRA layer records its K-slice for
+            # L_align in calculate_loss. Skip on validation so eval forwards
+            # never pollute the training capture buffer.
+            #
+            # CFG note. With do_cfg / do_random_cfg the trainer runs an
+            # uncond forward in the same batch. The exact concat order of
+            # cond/uncond is not part of TARA's design assumptions, so the
+            # mask alignment under CFG is unsafe; we skip TARA on those
+            # steps with a one-shot warning rather than risk a silent
+            # mis-aligned alignment loss.
+            tara_enabled_for_step = (
+                self.tara_config is not None
+                and self.tara_config.enabled
+                and not validate_only
+                and isinstance(conditioned_prompts, list)
+                and len(conditioned_prompts) > 0
+                and isinstance(conditioned_prompts[0], str)
+            )
+            if tara_enabled_for_step and (
+                getattr(self.train_config, "do_cfg", False)
+                or getattr(self.train_config, "do_random_cfg", False)
+            ):
+                if not getattr(self, "_tara_cfg_warning_emitted", False):
+                    print_acc(
+                        "[TARA] do_cfg / do_random_cfg is enabled — TARA "
+                        "capture and TFM masking are skipped on these steps "
+                        "to avoid mis-aligned masks across the cond/uncond "
+                        "concatenation order. Disable CFG to keep TARA active."
+                    )
+                    self._tara_cfg_warning_emitted = True
+                tara_enabled_for_step = False
+                TARAController.enable_capture(False)
+                TARAController.clear_buffer()
+                TARAController._mask = None
+            if tara_enabled_for_step:
+                tara_tokenizer = self.sd.tokenizer
+                if isinstance(tara_tokenizer, list):
+                    tara_tokenizer = tara_tokenizer[0]
+                if tara_tokenizer is None:
+                    raise RuntimeError(
+                        "TARA enabled but self.sd.tokenizer is None — make sure "
+                        "the model wrapper exposes a tokenizer (e.g. Qwen2Tokenizer "
+                        "for Qwen-Image) before launching training."
+                    )
+                self._autodetect_tara_template()
+                try:
+                    rare_idx, class_idx, mask = tokenize_and_locate_batch(
+                        tara_tokenizer,
+                        conditioned_prompts,
+                        self.tara_config.rare_token,
+                        self.tara_config.class_token,
+                        prompt_template=self.tara_config.prompt_template,
+                        template_drop_idx=self.tara_config.template_drop_idx,
+                    )
+                except ValueError as e:
+                    # Most common cause: MuDI Seg-Mix produced a caption
+                    # like "<a> and <b>" that lacks the class_token. We
+                    # disable TARA for this batch and continue training.
+                    if not getattr(self, "_tara_locate_warning_emitted", False):
+                        print_acc(
+                            f"[TARA] tokenize_and_locate_batch failed on a "
+                            f"batch caption ({e}); TARA capture is skipped "
+                            f"for that step. This is expected if MuDI "
+                            f"Seg-Mix is also enabled and rewrites captions "
+                            f"without the class anchor."
+                        )
+                        self._tara_locate_warning_emitted = True
+                    TARAController.enable_capture(False)
+                    TARAController.clear_buffer()
+                    TARAController._mask = None
+                else:
+                    TARAController.set_token_indices(rare_idx, class_idx, int(mask.shape[-1]))
+                    TARAController.set_mask(
+                        mask,
+                        device=self.device_torch,
+                        dtype=get_torch_dtype(self.train_config.dtype),
+                    )
+                    TARAController.clear_buffer()
+                    TARAController.enable_capture(True)
+            elif self.tara_config is not None and self.tara_config.enabled:
+                # Validation pass or text embeddings already cached — capture
+                # must stay off so eval-time K-vectors do not leak into the
+                # next training step's L_align buffer.
+                TARAController.enable_capture(False)
+
             if self.train_config.do_cfg or self.train_config.do_random_cfg:
                 # pick random negative prompts
                 if self.negative_prompt_pool is not None:
@@ -1400,8 +1737,14 @@ class SDTrainer(BaseSDTrainProcess):
                     # expand to match latents
                     mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
                     mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
-                    # make avg 1.0
-                    mask_multiplier = mask_multiplier / mask_multiplier.mean()
+                    # Per-sample normalization: each sample's mean is rescaled to 1.0
+                    # independently. A global batch mean would make samples with higher
+                    # mask coverage contribute disproportionately more gradient within
+                    # a batch; per-sample normalization makes the effective gradient
+                    # magnitude invariant to inter-sample mask coverage variance.
+                    reduce_dims = list(range(1, mask_multiplier.ndim))
+                    sample_mean = mask_multiplier.mean(dim=reduce_dims, keepdim=True).clamp(min=1e-4)
+                    mask_multiplier = mask_multiplier / sample_mean
 
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):

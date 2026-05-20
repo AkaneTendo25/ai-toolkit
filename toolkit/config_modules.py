@@ -930,6 +930,12 @@ class DatasetConfig:
         self.alpha_mask: bool = kwargs.get('alpha_mask', False)  # if true, will use alpha channel as mask
         self.mask_path: str = kwargs.get('mask_path',
                                          None)  # focus mask (black and white. White has higher loss than black)
+        # MuDI Seg-Mix augmentation config (Jang et al., NeurIPS 2024).
+        # When set, the dataloader composes two-subject training samples on
+        # the fly with probability ``prob`` and rewrites the caption. The
+        # composite mask flows through the existing focus-mask pipeline, so
+        # no trainer-side changes are required. See toolkit/mudi.py.
+        self.seg_mix: dict = kwargs.get('seg_mix', None)
         self.unconditional_path: str = kwargs.get('unconditional_path',
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask

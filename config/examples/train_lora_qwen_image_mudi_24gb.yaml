@@ -1,0 +1,117 @@
+---
+# MuDI (Multi-subject Decoupled Identification) example — Jang et al.,
+# NeurIPS 2024 (arXiv 2404.04243).
+#
+# MuDI is purely data-centric: there is no LoRA-architecture change and no
+# new loss term. With probability ``seg_mix.prob`` (default 0.3) the
+# dataloader composes a synthetic two-subject training image by cropping
+# the foreground of an anchor sample and a randomly sampled peer (from a
+# different subject) by their SAM masks, places them side by side on a
+# neutral canvas, and rewrites the caption to mention both triggers.
+# The composite mask flows through ai-toolkit's existing focus-mask channel
+# (``mask_multiplier``) so the loss is weighted toward foreground; setting
+# ``mask_min_value`` (or ``soft_alpha`` here, they encode the same floor)
+# to 0.3 reproduces the paper's soft-mask formula M_soft = M·(1-α) + α.
+#
+# Required pre-requisites
+#   1. A directory layout that gives every image a clear subject id. The
+#      default ``subject_id_pattern: parent_dir`` expects DreamBooth-style
+#      subdirectories, e.g.
+#          dataset_root/
+#              subject_a/   img_001.png img_002.png ...
+#              subject_b/ ...
+#              subject_c/  ...
+#   2. A binary segmentation mask per image (white = subject foreground),
+#      generated offline. See scripts/mudi_sam_preprocess.py for a stub
+#      describing the SAM2 + OWLv2 pipeline the authors use; we keep mask
+#      generation out of the trainer because it is heavy and one-shot.
+#      Masks must mirror the dataset layout, e.g.
+#          masks_root/
+#              subject_a/   img_001.png ...
+#              ...
+#
+# Caveats
+#   - Latent caching (``cache_latents`` / ``cache_latents_to_disk``) is
+#     incompatible with Seg-Mix and is rejected at dataset load time.
+#   - Captions are merged with the per-sample ``pair_trigger_format``; make
+#     sure each sample's individual caption is already well-formed (e.g.
+#     contains its trigger word).
+#   - The mean-shifted noise initialization from MuDI §3 is *not*
+#     implemented; FLUX-branch authors report Seg-Mix alone is sufficient
+#     on flow-matching backbones, and they did not validate the noise
+#     init for FLUX. Revisit only if Seg-Mix alone underperforms.
+
+job: extension
+config:
+  name: "my_first_qwen_image_mudi_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/dataset_root"
+          mask_path: "/path/to/masks_root"
+          mask_min_value: 0.3
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          # Seg-Mix requires runtime image composition — disable both caches.
+          cache_latents: false
+          cache_latents_to_disk: false
+          resolution: [ 1024 ]
+          seg_mix:
+            enabled: true
+            prob: 0.3
+            soft_alpha: 0.3
+            subject_id_pattern: "parent_dir"
+            pair_trigger_format: "{a} and {b}"
+            layout_mode: "side_by_side"
+            scale_jitter: 0.2
+            feather_blur_px: 8
+      train:
+        batch_size: 1
+        cache_text_embeddings: false
+        steps: 3000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        dtype: bf16
+      model:
+        name_or_path: "Qwen/Qwen-Image"
+        arch: "qwen_image"
+        quantize: true
+        qtype: "uint3|ostris/accuracy_recovery_adapters/qwen_image_torchao_uint3.safetensors"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: true
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "<subject_a> and <subject_b> shaking hands"
+          - "<subject_a> and <subject_c> at a press conference"
+          - "<subject_b> and <subject_c> negotiating"
+          - "<subject_a> alone, portrait"
+          - "<subject_b> alone, portrait"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 3
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'

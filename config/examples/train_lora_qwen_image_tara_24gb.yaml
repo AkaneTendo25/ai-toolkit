@@ -1,0 +1,102 @@
+---
+# Token-Aware LoRA (TARA) example — Peng et al., AAAI 2026 (arXiv 2508.08812).
+#
+# TARA gates the LoRA delta on the text-stream key/value projections
+# (Qwen-Image: attn.add_k_proj, attn.add_v_proj inside QwenDoubleStreamAttn)
+# along the token axis: ΔK / ΔV are zeroed at every text-token position
+# except the rare identifier V*. An auxiliary alignment loss L_align pulls
+# K(V*) toward K(class_anchor) so the rare token's attention map lands on
+# the same image region as its class word.
+#
+# Required prompt structure
+#   Every caption in the dataset MUST contain both ``rare_token`` and
+#   ``class_token`` (typically as "<rare> <class>", e.g. "xlo man"). The
+#   tokenize hook locates both per sample; if either is missing it raises.
+#
+# Multi-concept inference
+#   The current TARAController is a process-wide singleton suitable for
+#   training one concept at a time and inference with one TARA-LoRA at a
+#   time. Composing N>1 TARA-LoRAs in a single forward pass requires
+#   per-network state and is not yet supported here.
+#
+# Caveats
+#   - rare_token MUST be a token the Qwen tokenizer keeps as a single piece
+#     (or as a small fixed sequence of subwords — multi-subword V* is
+#     supported and the mask covers every subword position).
+#   - Do not place rare_token inside the negative prompt for CFG; the
+#     uncond branch shares the same mask and would inject delta there too.
+#   - target_text_modules below restricts LoRA wrapping to text-stream
+#     projections; image-stream attention and FFN are not adapted.
+
+job: extension
+config:
+  name: "my_first_qwen_image_tara_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      trigger_word: "xlo"
+      network:
+        type: "lora"
+        linear: 8
+        linear_alpha: 8
+        network_kwargs:
+          tara:
+            enabled: true
+            rare_token: "xlo"
+            class_token: "man"
+            lambda_align: 1.0
+            target_text_modules: ["add_k_proj", "add_v_proj"]
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          # Captions MUST follow a "<rare> <class> ..." structure, e.g.
+          # "xlo man at a cafe". TARA fails loudly if either token is
+          # missing from a caption.
+          caption_dropout_rate: 0.0
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 512, 768, 1024 ]
+      train:
+        batch_size: 1
+        cache_text_embeddings: false
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: 1e-5
+        dtype: bf16
+      model:
+        name_or_path: "Qwen/Qwen-Image"
+        arch: "qwen_image"
+        quantize: true
+        qtype: "uint3|ostris/accuracy_recovery_adapters/qwen_image_torchao_uint3.safetensors"
+        quantize_te: true
+        qtype_te: "qfloat8"
+        low_vram: true
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "xlo man holding a sign that says 'I LOVE PROMPTS!'"
+          - "xlo man at a cafe drinking coffee"
+          - "xlo man on a beach at sunset"
+          - "xlo man in a wood shop building a chair"
+          - "xlo man playing the guitar on stage"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 3
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'

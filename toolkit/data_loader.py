@@ -24,6 +24,7 @@ from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatc
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 from toolkit.ortholora_task_sampler import TaskWindowBatchSampler, TaskWindowIndexSampler
+from toolkit.mudi import MuDIConfig, extract_subject_id, image_collage, make_pair_caption
 
 import platform
 
@@ -582,6 +583,41 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             else:
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
+        # MuDI Seg-Mix: index file_list by subject id so the per-sample peer
+        # lookup is O(1). Latent caching is fundamentally incompatible with
+        # Seg-Mix (the on-the-fly composite has no precomputed latent), so we
+        # bail loudly rather than silently train on stale latents.
+        self.mudi_config: 'MuDIConfig | None' = MuDIConfig.from_dict(
+            getattr(dataset_config, "seg_mix", None)
+        )
+        self._subject_id_index: dict[str, list[int]] = {}
+        if self.mudi_config is not None and self.mudi_config.enabled:
+            if self.is_caching_latents:
+                raise ValueError(
+                    "MuDI Seg-Mix is incompatible with cached latents. Set "
+                    "cache_latents=false and cache_latents_to_disk=false on this "
+                    "dataset, or disable seg_mix.enabled."
+                )
+            for idx, fi in enumerate(self.file_list):
+                sid = extract_subject_id(fi.path, self.mudi_config.subject_id_pattern)
+                if sid:
+                    self._subject_id_index.setdefault(sid, []).append(idx)
+            n_subjects = len(self._subject_id_index)
+            if n_subjects < 2:
+                print_acc(
+                    f"[MuDI] WARNING: only {n_subjects} subject(s) detected via "
+                    f"pattern={self.mudi_config.subject_id_pattern!r}; Seg-Mix "
+                    f"needs at least 2 subjects to pair, every sample will pass "
+                    f"through unaugmented."
+                )
+            else:
+                print_acc(
+                    f"[MuDI] Seg-Mix enabled with prob={self.mudi_config.prob}; "
+                    f"{n_subjects} subjects indexed: "
+                    f"{sorted(self._subject_id_index.keys())[:5]}"
+                    f"{'...' if n_subjects > 5 else ''}"
+                )
+
         self.setup_epoch()
 
     def setup_epoch(self):
@@ -617,6 +653,50 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         file_item.ortholora_task_index = self.ortholora_task_index
         file_item.load_and_process_image(self.transform)
         file_item.load_caption(self.caption_dict)
+
+        # MuDI Seg-Mix: with probability prob, compose this anchor with a
+        # peer sample from a different subject and rewrite the caption. We
+        # gracefully fall through (anchor only) when no peer is available
+        # (single-subject dataset, missing masks, etc.) so training never
+        # crashes on a degenerate batch.
+        cfg = self.mudi_config
+        if (
+            cfg is not None
+            and cfg.enabled
+            and len(self._subject_id_index) >= 2
+            and random.random() < cfg.prob
+        ):
+            anchor_id = extract_subject_id(file_item.path, cfg.subject_id_pattern)
+            other_subjects = [s for s in self._subject_id_index if s != anchor_id]
+            if other_subjects and file_item.mask_tensor is not None:
+                pair_subject = random.choice(other_subjects)
+                pair_idx = random.choice(self._subject_id_index[pair_subject])
+                pair_item: 'FileItemDTO' = copy.deepcopy(self.file_list[pair_idx])
+                pair_item.ortholora_task_index = self.ortholora_task_index
+                pair_item.load_and_process_image(self.transform)
+                pair_item.load_caption(self.caption_dict)
+                if pair_item.mask_tensor is not None:
+                    collage_img, collage_mask = image_collage(
+                        file_item.tensor,
+                        file_item.mask_tensor,
+                        pair_item.tensor,
+                        pair_item.mask_tensor,
+                        cfg,
+                    )
+                    file_item.tensor = collage_img
+                    # Re-apply the soft floor that ai-toolkit's MaskMixin
+                    # applies on disk-loaded masks (composite mask is in
+                    # [0, 1] from image_collage; we map it into
+                    # [soft_alpha, 1] so the trainer's mask_multiplier
+                    # weights background loss by soft_alpha rather than 0).
+                    file_item.mask_tensor = (
+                        collage_mask * (1.0 - cfg.soft_alpha) + cfg.soft_alpha
+                    )
+                    file_item.caption = make_pair_caption(
+                        file_item.caption, pair_item.caption, cfg.pair_trigger_format
+                    )
+                    file_item._is_segmix = True
+
         return file_item
 
     def __getitem__(self, item):

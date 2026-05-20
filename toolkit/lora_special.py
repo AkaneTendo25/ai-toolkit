@@ -17,6 +17,21 @@ from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, Extractable
 
 from toolkit.kohya_lora import LoRANetwork
 from toolkit.models.DoRA import DoRAModule
+from toolkit.ortha import OrthAConfig, apply_ortha_init
+from toolkit.tara import TARAConfig, TARAController
+from toolkit.network_mixins import broadcast_and_multiply
+try:
+    from optimum.quanto import QTensor
+except ImportError:
+    # optimum-quanto is optional. When it is missing we substitute a
+    # private sentinel class so isinstance(x, QTensor) is well-defined
+    # and always False — no real QTensor can ever exist in this process.
+    # The dequantize branch in TARALoRAModule.forward simply never fires,
+    # which is the correct behaviour when quanto is absent.
+    class _MissingQTensorSentinel:  # noqa: D401
+        """Sentinel used when optimum-quanto is not installed."""
+
+    QTensor = _MissingQTensorSentinel  # type: ignore
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -121,6 +136,26 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         if not self.full_rank:
             torch.nn.init.zeros_(self.lora_up.weight)
 
+        # OrthA: replace lora_down with a frozen orthonormal row-subset.
+        # Only meaningful for Linear; conv2d falls back to Kaiming with a warning.
+        self.ortha_active = False
+        ortha_cfg: Optional[OrthAConfig] = kwargs.get("ortha_config", None)
+        if ortha_cfg is not None and ortha_cfg.enabled and not self.full_rank:
+            if org_module.__class__.__name__ in CONV_MODULES:
+                print(
+                    f"[OrthA] Skipping {lora_name}: conv2d weights are not supported, "
+                    f"falling back to standard Kaiming init."
+                )
+            else:
+                apply_ortha_init(
+                    lora_down=self.lora_down,
+                    lora_up=self.lora_up,
+                    rank=self.lora_dim,
+                    in_features=in_dim,
+                    cfg=ortha_cfg,
+                )
+                self.ortha_active = True
+
         self.multiplier: Union[float, List[float]] = multiplier
         # wrap the original module so it doesn't get weights updated
         self.org_module = [org_module]
@@ -133,6 +168,171 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
         # del self.org_module
+
+
+class TARALoRAModule(LoRAModule):
+    """LoRAModule that gates its delta along the token axis (TFM) and feeds
+    K-vector slices into the TARAController buffer for L_align.
+
+    Forward replicates LoRAModule.forward but, after computing the standard
+    base + scaled_lora_output, it (a) records ``base[class_idx]`` and
+    ``(base + delta)[V*_idx]`` for the alignment loss when capture is on,
+    and (b) zeros out the LoRA delta everywhere except at the rare-token
+    positions before adding it back to the base output. Activates only when
+    the layer's input has the same token-axis length as the controller's
+    seq_len — non-text-stream layers (image-stream Linears, text encoder)
+    pass through as plain LoRAModule.
+    """
+
+    def forward(self, x, *args, **kwargs):
+        network = self.network_ref()
+        if network.is_lorm:
+            return self.lorm_forward(x, *args, **kwargs)
+
+        skip = (
+            (not network.is_active)
+            or network.is_merged_in
+            or network._multiplier == 0
+        )
+        if skip:
+            return self.org_forward(x, *args, **kwargs)
+
+        org_forwarded = self.org_forward(x, *args, **kwargs)
+
+        if isinstance(x, QTensor):
+            x = x.dequantize()
+        lora_input = x.to(self.lora_down.weight.dtype)
+        lora_output = self._call_forward(lora_input)
+        multiplier = self.network_ref().torch_multiplier
+
+        lora_output_batch_size = lora_output.size(0)
+        multiplier_batch_size = multiplier.size(0)
+        if lora_output_batch_size != multiplier_batch_size:
+            num_interleaves = lora_output_batch_size // multiplier_batch_size
+            multiplier = multiplier.repeat_interleave(num_interleaves)
+
+        scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
+        scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
+
+        # === TARA: TAL capture and TFM mask, both gated on a token-axis
+        # length match with the controller. Mask is either [T] (broadcast
+        # across the batch) or [B, T] (per-sample). For per-sample mode,
+        # rare/class indices arrive as [B, k] padded with -1.
+        # When the runtime token-axis length disagrees with the controller's
+        # seq_len (image-stream layer, padded encoder_hidden_states, etc.)
+        # we silently pass through — log once per (lora_name, mismatch) pair
+        # so a global silent disable does not hide a real config bug.
+        seq_len = TARAController.get_seq_len()
+        if (
+            scaled_lora_output.dim() == 3
+            and seq_len is not None
+            and scaled_lora_output.shape[1] != seq_len
+        ):
+            TARAController.increment_mask_passthrough()
+            if not getattr(self, "_tara_mismatch_logged", False):
+                print(
+                    f"[TARA] Pass-through: layer {self.lora_name} runtime token-axis "
+                    f"{scaled_lora_output.shape[1]} != controller seq_len {seq_len}; "
+                    f"mask not applied (this is expected for image-stream layers "
+                    f"and CFG uncond forwards with empty negative prompt; "
+                    f"unexpected if the layer was meant to be text-stream)."
+                )
+                self._tara_mismatch_logged = True
+        if (
+            scaled_lora_output.dim() == 3
+            and seq_len is not None
+            and scaled_lora_output.shape[1] == seq_len
+        ):
+            B = scaled_lora_output.shape[0]
+            if TARAController.is_capture_active():
+                rare_idx = TARAController.get_rare_indices()
+                class_idx = TARAController.get_class_indices()
+                if rare_idx is not None and class_idx is not None:
+                    rare_idx_dev = rare_idx.to(org_forwarded.device)
+                    class_idx_dev = class_idx.to(org_forwarded.device)
+                    # base_class is captured detached — W_K is frozen and
+                    # x_class does not depend on the LoRA. full_v MUST keep
+                    # the autograd link through delta_at_rare so L_align
+                    # actually backprops into the LoRA-up parameters.
+                    base_class, valid_class = self._gather_per_sample_indices(
+                        org_forwarded, class_idx_dev
+                    )
+                    base_class = base_class.detach()
+                    delta_at_rare, valid_v = self._gather_per_sample_indices(
+                        scaled_lora_output, rare_idx_dev
+                    )
+                    base_at_rare, _ = self._gather_per_sample_indices(
+                        org_forwarded, rare_idx_dev
+                    )
+                    base_at_rare = base_at_rare.detach()
+                    full_v = base_at_rare + delta_at_rare
+                    TARAController.record_layer(
+                        self.lora_name, base_class, full_v,
+                        valid_class=valid_class, valid_v=valid_v,
+                    )
+
+            mask = TARAController.get_mask()
+            if mask is not None:
+                TARAController.increment_mask_apply()
+                mask_dev = mask.to(scaled_lora_output.dtype).to(scaled_lora_output.device)
+                if mask_dev.dim() == 1:
+                    mask_view = mask_dev.view(1, -1, 1)
+                else:
+                    # [B, T] -> [B, T, 1]; broadcast to one-LoRA-per-batch
+                    # if the network is run on a CFG-doubled batch by
+                    # tiling per-sample masks.
+                    if mask_dev.shape[0] != B:
+                        if B % mask_dev.shape[0] == 0:
+                            mask_dev = mask_dev.repeat_interleave(
+                                B // mask_dev.shape[0], dim=0
+                            )
+                        else:
+                            raise RuntimeError(
+                                f"TARA mask batch dimension {mask_dev.shape[0]} cannot "
+                                f"broadcast to runtime batch {B}"
+                            )
+                    mask_view = mask_dev.unsqueeze(-1)
+                scaled_lora_output = scaled_lora_output * mask_view
+
+        return org_forwarded + scaled_lora_output
+
+    @staticmethod
+    def _gather_per_sample_indices(
+        tensor: torch.Tensor, indices: torch.Tensor
+    ) -> tuple:
+        """Pick token positions from ``tensor`` shape ``[B, T, D]``.
+
+        ``indices`` is either ``[k]`` (same positions for every batch sample —
+        legacy single-prompt path) or ``[B, k]`` (per-sample positions, with
+        -1 padding which is zero-masked here so padded slots contribute zero
+        to L_align).
+
+        Returns ``(gathered, valid_mask)`` where:
+            * ``gathered`` is ``[B, k, D]`` with padded slots zeroed,
+            * ``valid_mask`` is ``[B, k]`` boolean (True = real subword,
+              False = padding) so callers can do a masked reduce in the
+              alignment loss instead of biasing the mean by padded zeros.
+              When ``indices`` is 1D the mask is all-True.
+        """
+        if indices.dim() == 1:
+            gathered = tensor.index_select(1, indices)
+            valid_mask = torch.ones(
+                tensor.shape[0], indices.shape[0], dtype=torch.bool, device=tensor.device
+            )
+            return gathered, valid_mask
+        # per-sample: gather positions sample by sample using torch.gather
+        B, T, D = tensor.shape
+        if indices.shape[0] != B:
+            raise RuntimeError(
+                f"TARA per-sample indices have batch {indices.shape[0]} but tensor "
+                f"has batch {B}"
+            )
+        valid = indices >= 0
+        clamped = indices.clamp(min=0)
+        gather_idx = clamped.unsqueeze(-1).expand(-1, -1, D)
+        gathered = torch.gather(tensor, dim=1, index=gather_idx)
+        gathered = gathered * valid.unsqueeze(-1).to(gathered.dtype)
+        return gathered, valid
 
 
 class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
@@ -262,6 +462,47 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             module_class = LokrModule
         self.network_config: NetworkConfig = kwargs.get("network_config", None)
 
+        # OrthA configuration (Po et al., CVPR 2024). Read from network_kwargs.ortha
+        # in YAML; only applied when network_type == "lora" (not DoRA / Lokr).
+        self.ortha_config: Optional[OrthAConfig] = OrthAConfig.from_dict(
+            kwargs.get("ortha", None)
+        )
+
+        # TARA configuration (Peng et al., AAAI 2026). Read from
+        # network_kwargs.tara in YAML. When enabled we (a) swap module_class
+        # to TARALoRAModule so each wrapped Linear gates its delta along the
+        # token axis, and (b) restrict only_if_contains to text-stream
+        # projections by default so we do not also wrap image-stream
+        # attention or FFN layers.
+        self.tara_config: Optional[TARAConfig] = TARAConfig.from_dict(
+            kwargs.get("tara", None)
+        )
+        if self.tara_config is not None and self.tara_config.enabled:
+            if self.ortha_config is not None and self.ortha_config.enabled and self.tara_config.lambda_align != 0:
+                raise ValueError(
+                    "OrthA and TARA cannot both be enabled in the same network: "
+                    "OrthA freezes lora_down, which prevents TARA from training "
+                    "the masked delta. Pick one or wire them on disjoint module "
+                    "subsets through separate LoRASpecialNetwork instances."
+                )
+            if self.network_type.lower() != "lora":
+                raise ValueError(
+                    f"TARA requires network_type='lora', got {self.network_type!r}"
+                )
+            if module_class is LoRAModule:
+                module_class = TARALoRAModule
+                self.module_class = TARALoRAModule
+            elif module_class is not TARALoRAModule:
+                raise ValueError(
+                    "TARA cannot be combined with DoRA or Lokr modules"
+                )
+            if self.only_if_contains is None:
+                self.only_if_contains = list(self.tara_config.target_text_modules)
+                print(
+                    f"[TARA] only_if_contains not set; defaulting to "
+                    f"{self.only_if_contains} (text-stream projections only)."
+                )
+
         self.peft_format = peft_format
         self.is_transformer = is_transformer
         
@@ -280,11 +521,20 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 self.peft_format = True
 
         if self.peft_format:
-            # no alpha for peft
-            self.alpha = self.lora_dim
-            alpha = self.alpha
-            self.conv_alpha = self.conv_lora_dim
-            conv_alpha = self.conv_alpha
+            # Note: peft_format normally hard-codes alpha=rank
+            # for transformer-based models, which makes alpha/rank-ratio sweeps
+            # impossible. When network_kwargs.preserve_alpha=true is set in the
+            # YAML, keep the explicit linear_alpha as configured.
+            preserve_alpha = bool(
+                self.network_config is not None
+                and getattr(self.network_config, "network_kwargs", {}).get("preserve_alpha", False)
+            )
+            if not preserve_alpha:
+                # no alpha for peft (default behaviour)
+                self.alpha = self.lora_dim
+                alpha = self.alpha
+                self.conv_alpha = self.conv_lora_dim
+                conv_alpha = self.conv_alpha
 
         self.full_train_in_out = full_train_in_out
 
@@ -430,12 +680,19 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                 continue
                             
                             module_kwargs = {}
-                            
+
                             if self.network_type.lower() == "lokr":
                                 module_kwargs["factor"] = self.network_config.lokr_factor
-                            
+
                             if self.is_ara:
                                 module_kwargs["is_ara"] = True
+
+                            if (
+                                self.ortha_config is not None
+                                and self.ortha_config.enabled
+                                and self.network_type.lower() == "lora"
+                            ):
+                                module_kwargs["ortha_config"] = self.ortha_config
 
                             lora = module_class(
                                 lora_name,
@@ -577,9 +834,20 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 unet.conv_in = self.unet_conv_in
                 unet.conv_out = self.unet_conv_out
 
+    def _refreeze_ortha_lora_down(self):
+        # super().prepare_optimizer_params and prepare_grad_etc both call
+        # self.requires_grad_(True) which un-freezes the orthonormal lora_down.
+        # OrthA requires lora_down to stay frozen, so we re-apply it here.
+        if self.ortha_config is None or not self.ortha_config.enabled:
+            return
+        for lora in self.text_encoder_loras + self.unet_loras:
+            if getattr(lora, "ortha_active", False):
+                lora.lora_down.weight.requires_grad_(False)
+
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
         # call Lora prepare_optimizer_params
         all_params = super().prepare_optimizer_params(text_encoder_lr, unet_lr, default_lr)
+        self._refreeze_ortha_lora_down()
 
         if self.full_train_in_out:
             base_model = self.base_model_ref() if self.base_model_ref is not None else None
@@ -591,5 +859,9 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                 all_params.append({"lr": unet_lr, "params": list(self.unet_conv_out.parameters())})
 
         return all_params
+
+    def prepare_grad_etc(self, text_encoder, unet):
+        super().prepare_grad_etc(text_encoder, unet)
+        self._refreeze_ortha_lora_down()
 
 
