@@ -82,15 +82,17 @@ export default function JobOverview({ job }: JobOverviewProps) {
     }
   };
 
+  const jobType = job?.job_type || 'unknown';
+
   let status = job.status;
   if (isStopping) {
     status = 'stopping';
   }
 
   return (
-    <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+    <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-3">
       {/* Job Information Panel */}
-      <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
+      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
         <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
           <h2 className="text-gray-100">
             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-600 dark:text-amber-400 inline-block" /> {job.info}
@@ -100,17 +102,19 @@ export default function JobOverview({ job }: JobOverviewProps) {
 
         <div className="p-4 space-y-6 flex flex-col flex-grow">
           {/* Progress Bar */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-gray-400">Progress</span>
-              <span className="text-gray-200">
-                Step {job.step} of {totalSteps}
-              </span>
+          {job.job_type === 'train' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-400">Progress</span>
+                <span className="text-gray-200">
+                  Step {job.step} of {totalSteps}
+                </span>
+              </div>
+              <div className="w-full bg-gray-800 rounded-full h-2">
+                <div className="h-2 rounded-full bg-blue-500 transition-all" style={{ width: `${progress}%` }} />
+              </div>
             </div>
-            <div className="w-full bg-gray-800 rounded-full h-2">
-              <div className="h-2 rounded-full bg-blue-500 transition-all" style={{ width: `${progress}%` }} />
-            </div>
-          </div>
+          )}
 
           {/* Job Info Grid */}
           <div className="grid gap-4 grid-cols-1 md:grid-cols-3">
@@ -161,12 +165,14 @@ export default function JobOverview({ job }: JobOverviewProps) {
       </div>
 
       {/* GPU Widget Panel */}
-      <div className="col-span-1">
+      <div className="md:col-span-1">
         <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
         <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
-        <div className="mt-4">
-          <FilesWidget jobID={job.id} />
-        </div>
+        {jobType === 'train' && (
+          <div className="mt-4">
+            <FilesWidget jobID={job.id} jobName={job.name} />
+          </div>
+        )}
       </div>
     </div>
   );

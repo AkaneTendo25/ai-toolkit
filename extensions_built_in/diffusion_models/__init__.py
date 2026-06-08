@@ -83,6 +83,31 @@ def _zeta_chroma():
     return [ZetaChromaModel]
 
 
+def _ernie_image():
+    from .ernie_image import ErnieImageModel
+    return [ErnieImageModel]
+
+
+def _nucleus_image():
+    from .nucleus_image import NucleusImageModel
+    return [NucleusImageModel]
+
+
+def _hidream_o1():
+    from .hidream.hidream_o1_model import HidreamO1Model
+    return [HidreamO1Model]
+
+
+def _z_image_l2p():
+    from .z_image.z_image_l2p_model import ZImageL2PModel
+    return [ZImageL2PModel]
+
+
+def _ideogram4():
+    from .ideogram4 import Ideogram4Model
+    return [Ideogram4Model]
+
+
 for _label, _fn in (
     ("chroma", _chroma),
     ("hidream", _hidream),
@@ -95,5 +120,10 @@ for _label, _fn in (
     ("z_image", _z_image),
     ("ltx2", _ltx2),
     ("zeta_chroma", _zeta_chroma),
+    ("ernie_image", _ernie_image),
+    ("nucleus_image", _nucleus_image),
+    ("hidream_o1", _hidream_o1),
+    ("z_image_l2p", _z_image_l2p),
+    ("ideogram4", _ideogram4),
 ):
     _try_import(_fn, _label)

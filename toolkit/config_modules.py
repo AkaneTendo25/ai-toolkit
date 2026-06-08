@@ -6,6 +6,7 @@ import random
 import torch
 import torchaudio
 
+from toolkit.audio.album_artwork import add_album_artwork
 from toolkit.prompt_utils import PromptEmbeds
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
@@ -499,10 +500,15 @@ class TrainConfig:
         self.correct_pred_norm = kwargs.get('correct_pred_norm', False)
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
-        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow
+        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)
+        self.t0_velocity_equiv_weight = kwargs.get('t0_velocity_equiv_weight', False)
+        
+        # do additional fft loss
+        self.do_fft_loss = kwargs.get('do_fft_loss', False)
+        self.do_fft_velocity_equiv_weight = kwargs.get('do_fft_velocity_equiv_weight', False)
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
@@ -577,6 +583,11 @@ class TrainConfig:
         self.do_blank_stabilization = kwargs.get('do_blank_stabilization', False)
         
         self.audio_loss_multiplier = kwargs.get("audio_loss_multiplier", 1.0)
+        
+        # will throw detailed error when it goes over
+        self.max_loss_debug: bool = kwargs.get("max_loss_debug", False)
+        # will clip the loss to this amount to prevent wild outliers
+        self.max_loss: Optional[float] = kwargs.get("max_loss", None)
 
 
 ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
@@ -706,6 +717,8 @@ class ModelConfig:
         
         # model paths for models that support it
         self.model_paths = kwargs.get("model_paths", {})
+        
+        self.in_context = kwargs.get("in_context", False)
         
         # allow frontend to pass arch with a color like arch:tag
         # but remove the tag
@@ -853,7 +866,7 @@ class SliderConfig:
                 self.targets.append(target)
         print(f"Built {len(self.targets)} slider targets (with permutations)")
 
-ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask']
+ControlTypes = Literal['depth', 'line', 'pose', 'inpaint', 'mask', 'sapiens2_mask']
 
 class DatasetConfig:
     """
@@ -940,8 +953,9 @@ class DatasetConfig:
                                                   None)  # path where matching unconditional images are located
         self.invert_mask: bool = kwargs.get('invert_mask', False)  # invert mask
         self.mask_min_value: float = kwargs.get('mask_min_value', 0.0)  # min value for . 0 - 1
-        self.poi: Union[str, None] = kwargs.get('poi',
-                                                None)  # if one is set and in json data, will be used as auto crop scale point of interes
+        self.poi: Union[str, None] = kwargs.get('poi', None)
+        if self.poi is not None:
+            raise ValueError("poi is deprecated and is no longer supported")
         self.use_short_captions: bool = kwargs.get('use_short_captions', False)  # if true, will use 'caption_short' from json
         self.num_repeats: int = kwargs.get('num_repeats', 1)  # number of times to repeat dataset
         # cache latents will store them in memory
@@ -1208,15 +1222,18 @@ class GenerateImageConfig:
                 )
             else:
                 raise ValueError(f"Unsupported video format {self.output_ext}")
-        elif self.output_ext in ['wav', 'mp3']:
+        elif self.output_ext in ['wav', 'mp3', 'flac', 'ogg']:
             # save audio file
+            audio_path = self.get_image_path(count, max_count)
             torchaudio.save(
-                self.get_image_path(count, max_count), 
+                audio_path, 
                 image[0].to('cpu'),
                 sample_rate=48000, 
                 format=None, 
                 backend=None
             )
+            if self.output_ext == 'mp3':
+                add_album_artwork(audio_path)
         else:
             # TODO save image gen header info for A1111 and us, our seeds probably wont match
             image.save(self.get_image_path(count, max_count))
