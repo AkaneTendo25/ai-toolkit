@@ -108,6 +108,26 @@ def _ideogram4():
     return [Ideogram4Model]
 
 
+def _anima():
+    from .anima import AnimaModel
+    return [AnimaModel]
+
+
+def _prx_pixel_t2i():
+    from .prx_pixel_t2i import PRXPixelT2IModel
+    return [PRXPixelT2IModel]
+
+
+def _krea2():
+    from .krea2 import Krea2Model
+    return [Krea2Model]
+
+
+def _boogu_image():
+    from .boogu_image import BooguImageModel, BooguImageEditModel
+    return [BooguImageModel, BooguImageEditModel]
+
+
 for _label, _fn in (
     ("chroma", _chroma),
     ("hidream", _hidream),
@@ -124,6 +144,10 @@ for _label, _fn in (
     ("nucleus_image", _nucleus_image),
     ("hidream_o1", _hidream_o1),
     ("z_image_l2p", _z_image_l2p),
+    ("anima", _anima),
     ("ideogram4", _ideogram4),
+    ("prx_pixel_t2i", _prx_pixel_t2i),
+    ("krea2", _krea2),
+    ("boogu_image", _boogu_image),
 ):
     _try_import(_fn, _label)

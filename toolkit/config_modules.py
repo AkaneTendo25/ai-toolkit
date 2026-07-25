@@ -80,6 +80,7 @@ class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
         self.sample_every: int = kwargs.get('sample_every', 100)
+        self.sample_start_step: int = kwargs.get('sample_start_step', 0)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
         self.neg = kwargs.get('neg', False)
@@ -200,7 +201,7 @@ class NetworkConfig:
 
         self.transformer_only = kwargs.get('transformer_only', True)
         
-        self.lokr_full_rank = kwargs.get('lokr_full_rank', False)
+        self.lokr_full_rank = kwargs.get('lokr_full_rank', True)
         if self.lokr_full_rank and self.type.lower() == 'lokr':
             self.linear = 9999999999
             self.linear_alpha = 9999999999
@@ -220,6 +221,10 @@ class NetworkConfig:
         
         # start from a pretrained lora
         self.pretrained_lora_path = kwargs.get('pretrained_lora_path', None)
+        
+        # will create diffirential full weight modules for layers not conv/linear
+        # only useful in very special cases. 
+        self.all_layers = kwargs.get('all_layers', False)
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -330,6 +335,23 @@ class AdapterConfig:
         # for i2v adapter
         # append the masked start frame. During pretraining we will only do the vision encoder
         self.i2v_do_start_frame: bool = kwargs.get('i2v_do_start_frame', False)
+
+
+class ValidationItem:
+    def __init__(self, **kwargs):
+        self.image_path: str = kwargs.get('image_path', '')
+        self.prompt: str = kwargs.get('prompt', '')
+
+
+class ValidationConfig:
+    def __init__(self, **kwargs):
+        self.validation_items: List[ValidationItem] = [
+            item if isinstance(item, ValidationItem) else ValidationItem(**item)
+            for item in kwargs.get('validation_items', [])
+        ]
+        self.resolution: int = kwargs.get('resolution', 512)
+        self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
+        self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
 
 
 class EmbeddingConfig:
@@ -588,9 +610,13 @@ class TrainConfig:
         self.max_loss_debug: bool = kwargs.get("max_loss_debug", False)
         # will clip the loss to this amount to prevent wild outliers
         self.max_loss: Optional[float] = kwargs.get("max_loss", None)
+        self.validation_config: Optional[ValidationConfig] = None
+        validation = kwargs.get('validation_config', None)
+        if validation is not None:
+            self.validation_config: ValidationConfig = ValidationConfig(**validation)
 
 
-ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21']
+ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima']
 
 
 class ModelConfig:
@@ -621,6 +647,9 @@ class ModelConfig:
         # mainly for decompression loras for distilled models
         self.assistant_lora_path = kwargs.get('assistant_lora_path', None)
         self.inference_lora_path = kwargs.get('inference_lora_path', None)
+        # a lora that stays inactive except during the unconditional (negative)
+        # CFG pass -- used to learn the unconditional branch without a second model
+        self.unconditional_lora_path = kwargs.get('unconditional_lora_path', None)
         self.latent_space_version = kwargs.get('latent_space_version', None)
 
         # only for SDXL models for now
@@ -707,10 +736,14 @@ class ModelConfig:
 
         # compile the model with torch compile
         self.compile = kwargs.get("compile", False)
-        
+
         if self.compile and self.quantize:
-            print("Warning: You cannot compile a quantized model. Disabling compile.")
-            self.compile = False
+            print("Quantized model detected - allowing torch.compile (experimental)")
+        self.block_compile = kwargs.get("block_compile", False)
+        self.compile_mode = kwargs.get("compile_mode", "default")
+        self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
+        self.compile_dynamic = kwargs.get("compile_dynamic", True)
+        self.cache_size_limit = kwargs.get("cache_size_limit", None)
         
         # kwargs to pass to the model
         self.model_kwargs = kwargs.get("model_kwargs", {})
@@ -915,6 +948,10 @@ class DatasetConfig:
         self.flip_y: bool = kwargs.get('flip_y', False)
         self.augments: List[str] = kwargs.get('augments', [])
         self.control_path: Union[str,List[str]] = kwargs.get('control_path', None)  # depth maps, etc
+        # pull a random control image from the same folder as the image. Useful for folder grouped pairs.
+        self.control_from_same_folder: bool = kwargs.get('control_from_same_folder', False)
+        self.num_controls_from_same_folder: int = kwargs.get('num_controls_from_same_folder', 1)
+        
         if self.control_path == '':
             self.control_path = None
         
@@ -964,6 +1001,7 @@ class DatasetConfig:
         self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        self.load_image_when_caching_latents: bool = kwargs.get('load_image_when_caching_latents', False)
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)
 
@@ -1198,6 +1236,58 @@ class GenerateImageConfig:
         # join with folder
         return os.path.join(self.output_folder, filename)
 
+    def save_image_atomic(self, image, count: int = 0, max_count=0):
+        # write into a hidden tmp subfolder, then atomically move into place so
+        # watchers (UI/CDN) never see and cache a partially written file. Wraps
+        # self.save_image so it also covers models that replace that function.
+        real_folder = self.output_folder
+        tmp_folder = os.path.join(real_folder, '.tmp')
+        os.makedirs(tmp_folder, exist_ok=True)
+        self.output_folder = tmp_folder
+        try:
+            self.save_image(image, count, max_count)
+        finally:
+            self.output_folder = real_folder
+        files = os.listdir(tmp_folder)
+        # thumbs move into place first so they already exist when the media
+        # file appears in the samples folder
+        thumbs_folder = os.path.join(real_folder, '.thumbs')
+        for file in files:
+            tmp_thumb = os.path.join(tmp_folder, file + '.thumb')
+            try:
+                if self._generate_thumbnail(os.path.join(tmp_folder, file), tmp_thumb):
+                    os.makedirs(thumbs_folder, exist_ok=True)
+                    os.replace(tmp_thumb, os.path.join(thumbs_folder, file + '.jpg'))
+            except Exception as e:
+                print(f"Failed to generate thumbnail for {file}: {e}")
+        for file in files:
+            os.replace(os.path.join(tmp_folder, file), os.path.join(real_folder, file))
+
+    def _generate_thumbnail(self, media_path, thumb_path):
+        # 300x300 center-cropped 90% jpg. Returns True if one was written.
+        from PIL import Image as PILImage
+        ext = os.path.splitext(media_path)[1].lower()
+        img = None
+        if ext in ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']:
+            img = PILImage.open(media_path)  # animated formats open on the first frame
+        elif ext == '.mp4':
+            import cv2
+            cap = cv2.VideoCapture(media_path)
+            ok, frame = cap.read()
+            cap.release()
+            if ok:
+                img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if img is None:
+            return False
+        img = img.convert('RGB')
+        w, h = img.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        img = img.crop((left, top, left + side, top + side)).resize((300, 300), PILImage.LANCZOS)
+        img.save(thumb_path, format='JPEG', quality=90)
+        return True
+
     def save_image(self, image, count: int = 0, max_count=0):
         # make parent dirs
         os.makedirs(self.output_folder, exist_ok=True)
@@ -1400,14 +1490,12 @@ def validate_configs(
                 raise ValueError("All datasets must have cache_text_embeddings set to True when caching text embeddings is enabled.")
     
     # qwen image edit cannot cache text embeddings
-    if model_config.arch == 'qwen_image_edit':
+    if model_config.arch in ['qwen_image_edit', 'boogu_image_edit']:
         if train_config.unload_text_encoder:
-            raise ValueError("Cannot cache unload text encoder with qwen_image_edit model. Control images are encoded with text embeddings. You can cache the text embeddings though")
+            raise ValueError(f"Cannot cache unload text encoder with {model_config.arch} model. Control images are encoded with text embeddings. You can cache the text embeddings though")
     
     if train_config.diff_output_preservation and train_config.blank_prompt_preservation:
         raise ValueError("Cannot use both differential output preservation and blank prompt preservation at the same time. Please set one of them to False.")
     
     if train_config.batch_size > 1 and any(dataset_config.auto_frame_count for dataset_config in dataset_configs):
         raise ValueError("Cannot use batch size greater than 1 with auto_frame_count. Please set batch_size to 1 or auto_frame_count to False.")
-
-    
