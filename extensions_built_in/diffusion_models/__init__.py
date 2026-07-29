@@ -128,6 +128,11 @@ def _boogu_image():
     return [BooguImageModel, BooguImageEditModel]
 
 
+def _mageflow():
+    from .mageflow import MageFlowModel, MageFlowEditModel
+    return [MageFlowModel, MageFlowEditModel]
+
+
 for _label, _fn in (
     ("chroma", _chroma),
     ("hidream", _hidream),
@@ -149,5 +154,6 @@ for _label, _fn in (
     ("prx_pixel_t2i", _prx_pixel_t2i),
     ("krea2", _krea2),
     ("boogu_image", _boogu_image),
+    ("mageflow", _mageflow),
 ):
     _try_import(_fn, _label)
